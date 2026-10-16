@@ -84,4 +84,62 @@ typedef NS_ENUM(uint8_t, HBAVDTPSignal) {
 - (void)terminate;
 @end
 
+extern NSErrorDomain const HBErrorDomain;
+/// Named HBSessionError (not HBError) so it does not clash with a Swift-side HBError in HiResBuddyCore.
+typedef NS_ERROR_ENUM(HBErrorDomain, HBSessionError) {
+    HBErrorSinkRejected = 1,        // sink answered a setup command with a reject
+    HBErrorNoLDAC = 2,              // no free sink endpoint reports LDAC
+    HBErrorSinkDisconnected = 3,    // signaling channel closed under us
+    HBErrorChannelOpenFailed = 4,   // signaling channel could not be opened (after retries)
+    HBErrorTransportFailed = 5,     // helper could not hand over the transport channel
+};
+
+typedef NS_ENUM(NSInteger, HBSessionState) {
+    HBSessionIdle,
+    HBSessionConnecting,            // takeover, signaling channel, DISCOVER/GET_CAPABILITIES
+    HBSessionConfigured,            // SET_CONFIGURATION accepted; OPEN, transport, START in progress
+    HBSessionStreaming,
+    HBSessionSuspended,
+    HBSessionClosed,
+    HBSessionFailed,
+};
+
+@class HBAVDTPSession;
+
+@protocol HBAVDTPSessionDelegate <NSObject>
+/// Main queue. `err` is set only for HBSessionFailed.
+- (void)session:(HBAVDTPSession *)s didChangeState:(HBSessionState)state error:(nullable NSError *)err;
+@end
+
+/// AVDTP source session for one LDAC stream (a state machine over the prototype's player/ldacplay.m flow).
+/// Not thread-safe: call it and receive callbacks on the main queue.
+@interface HBAVDTPSession : NSObject
+- (instancetype)initWithDevice:(IOBluetoothDevice *)dev helper:(HBTransportHelperClient *)helper;
+/// For tests: the signaling channel is already open (no takeover, no device), and `provider` stands in for the
+/// helper — it is called after OPEN is accepted and must call its argument (on the main queue) with an fd, or -1.
+- (instancetype)initWithSignalingChannel:(HBL2CAPChannel *)sig transportProvider:(void (^)(void (^)(int fd)))provider;
+- (instancetype)init NS_UNAVAILABLE;
+@property(weak, nullable) id<HBAVDTPSessionDelegate> delegate;
+@property(readonly) HBSessionState state;
+/// Valid in Streaming/Suspended, -1 otherwise. Owned by the session (closed on stop/failure).
+@property(readonly) int transportFD;
+/// 0 when unknown (the helper hands over a bare fd).
+@property(readonly) uint16_t transportMTU;
+/// The LDAC sample-rate bit accepted by the sink; 0 before SET_CONFIGURATION is accepted.
+@property(readonly) uint8_t negotiatedSampleRateBit;
+/// Runs at the end of stopAndRestoreSystemAudio so macOS takes A2DP back. Default (device init): closeConnection,
+/// then openConnection 1.5 s later; nil for the test init.
+@property(copy, nullable) void (^restoreHook)(void);
+/// Full path to Streaming: takeover if the device is connected (closeConnection, then the signaling channel with
+/// up to 8 retries 2 s apart), DISCOVER, GET_CAPABILITIES until an LDAC sink, SET_CONFIGURATION, OPEN, transport, START.
+/// Only from Idle.
+- (void)startWithSampleRateBit:(uint8_t)sfBit;
+/// Streaming -> Suspended (SUSPEND) and back (START).
+- (void)suspend;
+- (void)resume;
+/// SUSPEND + CLOSE (each waited for at most 1 s), closes the channels, terminates the helper, then restoreHook.
+/// No-op when Idle or Closed.
+- (void)stopAndRestoreSystemAudio;
+@end
+
 NS_ASSUME_NONNULL_END
