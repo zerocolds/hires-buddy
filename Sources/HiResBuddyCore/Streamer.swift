@@ -15,9 +15,12 @@ public struct StreamStats: Sendable {
     public var writeErrors: Int
     /// Send ticks cut short because the transport was full (the packet stays queued).
     public var backpressureTicks: Int
+    /// Source blocks dropped because the input ring was full (the source delivered faster than it is drained).
+    public var inputOverflows: Int
 }
 
-/// Delivers interleaved stereo Float32 in blocks of any size, from any thread, until `stop`.
+/// Delivers interleaved stereo Float32 in blocks of any size, from any thread (also a real-time one: the
+/// Streamer's sink neither allocates nor locks), until `stop`. Blocks larger than 2 s at 96 kHz are dropped.
 public protocol PCMSource: AnyObject {
     func start(_ sink: @escaping (UnsafeBufferPointer<Float>) -> Void)
     func stop()
@@ -79,7 +82,7 @@ public final class Streamer {
         self.makeEncoder = makeEncoder
         stats = StreamStats(packets: 0, dropEvents: 0, bitrateKbps: 0, sampleRate: sampleRate.rawValue,
                             quality: quality, uptime: 0, bufferSeconds: 0, writeErrors: 0,
-                            backpressureTicks: 0)
+                            backpressureTicks: 0, inputOverflows: 0)
     }
 
     /// Starts the session; the source is started once the session reports Streaming.
@@ -115,10 +118,8 @@ public final class Streamer {
                 engine.queue.sync { engine.setPaused(false) }   // back from Suspended
             } else {
                 engine.queue.sync { engine.start(fd: session.transportFD) }
-                source.start { block in
-                    let samples = Array(block)
-                    engine.queue.async { engine.ingest(samples) }
-                }
+                let ring = engine.input
+                source.start { block in ring.write(block) }   // drained by the engine's send timer
             }
         case .suspended:
             if let engine { engine.queue.sync { engine.setPaused(true) } }
@@ -167,6 +168,11 @@ private final class StreamEngine: @unchecked Sendable {
     private static let blockSamples = LDACEncoder.framesPerBlock * 2
     private static let rtpHeaderBytes = 13   // RTP header + LDAC media payload header
     private static let leadSeconds = 0.25
+    private static let drainSamples = 4096
+
+    /// Written by the source (any thread, lock-free), drained on `queue` every send tick: 2 s of stereo at 96 kHz.
+    let input = PCMRingBuffer(capacity: 2 * 96_000 * 2)
+    private var drainBuffer: [Float]
 
     private let log = Logger(subsystem: "HiResBuddy", category: "stream")
     private let encoder: any PacketEncoder
@@ -203,6 +209,7 @@ private final class StreamEngine: @unchecked Sendable {
                             leadSeconds: Self.leadSeconds, prerollSeconds: 2 * Self.leadSeconds,
                             now: { ProcessInfo.processInfo.systemUptime })
         scratch = [Float](repeating: 0, count: Self.blockSamples)
+        drainBuffer = [Float](repeating: 0, count: Self.drainSamples)
     }
 
     func start(fd: Int32) {
@@ -245,7 +252,7 @@ private final class StreamEngine: @unchecked Sendable {
     }
 
     /// Cuts the block into 128-frame chunks, applies gain, encodes, and queues RTP packets.
-    func ingest(_ samples: [Float]) {
+    func ingest(_ samples: UnsafeBufferPointer<Float>) {
         guard isRunning else { return }
         pending.append(contentsOf: samples)
         var offset = 0
@@ -269,8 +276,19 @@ private final class StreamEngine: @unchecked Sendable {
         pending.removeFirst(offset)
     }
 
+    /// Moves everything the source has delivered so far into the encoder (also while paused, as before).
+    private func drainInput() {
+        while true {
+            let n = drainBuffer.withUnsafeMutableBufferPointer { input.read(into: $0) }
+            if n == 0 { return }
+            drainBuffer.withUnsafeBufferPointer { ingest(UnsafeBufferPointer(rebasing: $0[0..<n])) }
+        }
+    }
+
     private func pump() {
-        guard isRunning, !paused, fd >= 0 else { return }
+        guard isRunning else { return }
+        drainInput()
+        guard !paused, fd >= 0 else { return }
         while let next = queued.first {
             if !pacerStarted {
                 pacer.start()
@@ -319,7 +337,8 @@ private final class StreamEngine: @unchecked Sendable {
             uptime: now - startTime,
             bufferSeconds: Double(queuedFrames * encoder.samplesPerFrame) / Double(sampleRate),
             writeErrors: writeErrors,
-            backpressureTicks: backpressureTicks)
+            backpressureTicks: backpressureTicks,
+            inputOverflows: input.overflows)
         windowBytes = 0
         windowStart = now
         onStats?(s)

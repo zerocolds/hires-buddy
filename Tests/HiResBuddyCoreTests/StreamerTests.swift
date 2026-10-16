@@ -69,6 +69,20 @@ final class StreamerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(reports[1].bufferSeconds, 0.2, "about lead (0.25 s) stays queued behind the sender")
     }
 
+    func testRingBufferOverflowCountsDrops() throws {
+        let h = try Harness()
+        let streamer = Streamer(session: h.session, sampleRate: .hz48000, quality: .hq)
+        var reports: [StreamStats] = []
+        streamer.onStats = { reports.append($0) }
+        try streamer.start(source: FloodSource())   // 10 s of audio handed over at once, faster than any drain
+        spin(1.2)
+        streamer.stop()
+        _ = h.reader.finish()
+        guard let last = reports.last else { return XCTFail("no stats") }
+        XCTAssertGreaterThan(last.inputOverflows, 0)
+        XCTAssertGreaterThan(last.packets, 0, "what fitted is still streamed")
+    }
+
     func testBackpressureKeepsPacketsUntilTheReaderCatchesUp() throws {
         // a receive buffer of ~11 packets and a reader that starts late: writes fail with ENOBUFS (EAGAIN on a
         // stream socket) for a while, and those packets must stay queued rather than be lost
@@ -275,6 +289,19 @@ private final class SineSource: PCMSource, @unchecked Sendable {
             timer = nil
         }
     }
+}
+
+/// Calls the sink back to back from its own thread with 10 s of silence in 10 ms blocks.
+private final class FloodSource: PCMSource, @unchecked Sendable {
+    func start(_ sink: @escaping (UnsafeBufferPointer<Float>) -> Void) {
+        nonisolated(unsafe) let sink = sink
+        Thread.detachNewThread {
+            let block = [Float](repeating: 0, count: 960)
+            block.withUnsafeBufferPointer { for _ in 0..<1000 { sink($0) } }
+        }
+    }
+
+    func stop() {}
 }
 
 /// Records the loudest sample it was given; never produces a packet.

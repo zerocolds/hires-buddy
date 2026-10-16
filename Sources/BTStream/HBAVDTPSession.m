@@ -61,7 +61,8 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     HBAVDTPSignal _pending;                     // command we wait a response for; 0 = none
     uint8_t _pendingLabel;
     NSUInteger _txToken;                        // bumped per response/timeout: stale transaction deadlines bail out
-    int _openAttempts;                          // signaling open attempts made so far
+    int _openAttempts;                          // signaling open attempts made so far (this negotiation)
+    int _negotiationRetries;                    // negotiations restarted after a setup reject
     NSUInteger _attemptToken;                   // bumped when an attempt ends: stale callbacks/deadlines bail out
     NSUInteger _pagingToken;                    // attempt waiting for the baseband connection; 0 = none
     NSUInteger _epoch;                          // bumped on stop/failure: stale timers and callbacks bail out
@@ -79,6 +80,8 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     _signalingOpenTimeout = 3.0;
     _openRetryInterval = 1.0;
     _maxOpenAttempts = 10;
+    _negotiationRetryInterval = 2.0;
+    _maxNegotiationRetries = 3;
     NSString *addr = dev.addressString;
     _transportProvider = ^(void (^done)(int)) {
         [helper openTransportForAddress:addr psm:kAVDTPPSM completion:^(int fd, NSInteger code) {
@@ -105,6 +108,8 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     _signalingOpenTimeout = 3.0;
     _openRetryInterval = 1.0;
     _maxOpenAttempts = 10;
+    _negotiationRetryInterval = 2.0;
+    _maxNegotiationRetries = 3;
     _transportProvider = [provider copy];
     [self adoptSignaling:sig];
     return self;
@@ -398,14 +403,41 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     if (type != kMsgAccept) {
         uint8_t errCode = msg.length > 2 ? ((const uint8_t *)msg.bytes)[msg.length - 1] : 0;
         if (_state == HBSessionConnecting || _state == HBSessionConfigured) {
-            [self failWithCode:HBErrorSinkRejected
-                       message:[NSString stringWithFormat:@"sink rejected signal %d (error 0x%02x)", sig, errCode]];
+            NSString *why = [NSString stringWithFormat:@"sink rejected signal %d (error 0x%02x)", sig, errCode];
+            BOOL streamStep = sig == HBAVDTPSetConfiguration || sig == HBAVDTPOpen || sig == HBAVDTPStart;
+            BOOL canReopen = _dev != nil || _signalingOpener != nil;
+            if (streamStep && canReopen && _negotiationRetries < self.maxNegotiationRetries) [self restartNegotiation:why];
+            else [self failWithCode:HBErrorSinkRejected message:why];
         } else {
             SLOG(@"sink refused signal %d (error 0x%02x), state unchanged", sig, errCode);
         }
         return;
     }
     [self handleAccept:sig message:msg];
+}
+
+/// ABORT the stream we configured (answer ignored), drop the signaling channel and transport, and after
+/// negotiationRetryInterval start over with a fresh round of signaling-open attempts.
+- (void)restartNegotiation:(NSString *)why {
+    _negotiationRetries++;
+    SLOG(@"%@: restarting negotiation %d/%ld in %.1f s", why, _negotiationRetries, (long)self.maxNegotiationRetries,
+         self.negotiationRetryInterval);
+    if (_sig) [_sig write:[HBAVDTP command:HBAVDTPAbort label:(_label = (_label + 1) & 0x0f) payload:self.acpPayload]];
+    _epoch++;                                     // stale transport/attempt callbacks bail out
+    _txToken++;
+    _pending = 0;
+    _sig.delegate = nil;
+    [_sig close];
+    _sig = nil;
+    [_helper terminate];
+    if (_transportFD >= 0) close(_transportFD);
+    _transportFD = -1;
+    _negotiatedSampleRateBit = 0;
+    _openAttempts = 0;
+    NSUInteger epoch = _epoch;
+    [self setState:HBSessionConnecting error:nil];
+    if (_epoch != epoch) return;                  // the delegate stopped us
+    [self after:[self nanoseconds:self.negotiationRetryInterval] do:^(HBAVDTPSession *me) { [me openSignalingAttempt]; }];
 }
 
 - (void)handleSinkCommand:(NSData *)msg signal:(HBAVDTPSignal)sig channel:(HBL2CAPChannel *)c {

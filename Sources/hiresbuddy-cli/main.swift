@@ -127,9 +127,9 @@ capture?.onVolumeChange { v in printError(String(format: "volume %.2f", v)) }
 
 streamer.onStats = { s in
     let level = meter.map { String(format: "  peak %.0f dBFS", $0.takePeakDBFS()) } ?? ""
-    print(String(format: "%5.0fs  %@  %d Hz  %4d kbit/s  packets %6d  buffer %.2fs  drops %d  write errors %d  backpressure %d",
+    print(String(format: "%5.0fs  %@  %d Hz  %4d kbit/s  packets %6d  buffer %.2fs  drops %d  write errors %d  backpressure %d  overflows %d",
                  s.uptime, "\(s.quality)", s.sampleRate, s.bitrateKbps, s.packets, s.bufferSeconds, s.dropEvents,
-                 s.writeErrors, s.backpressureTicks) + level)
+                 s.writeErrors, s.backpressureTicks, s.inputOverflows) + level)
 }
 
 /// Ctrl-C / end of file → stop, then exit once Closed arrives and the restore hook (closeConnection, then

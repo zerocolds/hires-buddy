@@ -3,6 +3,13 @@ import Foundation
 
 /// Reads what the system plays into the "HiRes Buddy" virtual device: the driver mirrors its output to its input,
 /// and an IOProc on the input side hands the interleaved stereo Float32 blocks to the sink as the HAL delivers them.
+///
+/// Volume: the driver applies its own volume control (what the Mac volume keys set, dB taper, mute included) to the
+/// mirrored audio, so captured PCM is already at the user's volume — keep the Streamer's gain at 1.0, or the volume
+/// is applied twice. `deviceVolume`/`onVolumeChange` are for display only.
+///
+/// Reading the input side needs Microphone permission for the responsible process (NSMicrophoneUsageDescription);
+/// without it the HAL delivers silence, not an error.
 public final class AudioCapture: PCMSource {
     public static let deviceName = "HiRes Buddy"
 
@@ -61,7 +68,8 @@ public final class AudioCapture: PCMSource {
         sinkBox = nil
     }
 
-    /// The device's output volume (0…1, what the Mac volume keys set); 1.0 if it has no volume control.
+    /// The device's output volume scalar (0…1, what the Mac volume keys set); 1.0 if it has no volume control.
+    /// Already applied to the captured PCM by the driver.
     public var deviceVolume: Float {
         guard var address = volumeAddress() else { return 1 }
         var volume: Float32 = 1

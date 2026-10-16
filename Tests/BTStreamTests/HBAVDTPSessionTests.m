@@ -325,4 +325,105 @@ static uint8_t SignalOf(NSData *msg) { return msg.length > 1 ? ((const uint8_t *
     XCTAssertGreaterThanOrEqual(logged.count, 3u, @"each attempt is reported through logHandler");
 }
 
+#pragma mark - Negotiation retry after a setup reject
+
+/// Answers the channel's last command (same label) with `type` (2 accept, 3 reject) and `rest` hex bytes.
+static void Answer(HBFakeSignalingChannel *ch, uint8_t type, NSString *rest) {
+    const uint8_t *last = ch.sent.lastObject.bytes;
+    NSMutableData *msg = [NSMutableData dataWithBytes:(uint8_t[]){ (uint8_t)((last[0] & 0xf0) | type), last[1] } length:2];
+    [msg appendData:HEX(rest)];
+    [ch reply:msg];
+}
+
+/// DISCOVER → GET_CAPABILITIES (LDAC on the first queried endpoint) → SET_CONFIGURATION accepted; OPEN is sent.
+- (void)negotiateUpToOpenOn:(HBFakeSignalingChannel *)ch {
+    XCTAssertEqual(SignalOf(ch.sent.lastObject), HBAVDTPDiscover);
+    Answer(ch, 2, @"0c 08");                                         // one free sink, seid 3
+    XCTAssertEqual(SignalOf(ch.sent.lastObject), HBAVDTPGetCapabilities);
+    Answer(ch, 2, @"01 00 07 0a 00 ff 2d 01 00 00 aa 00 3c 07 04 02 02 00");
+    XCTAssertEqual(SignalOf(ch.sent.lastObject), HBAVDTPSetConfiguration);
+    Answer(ch, 2, @"");
+    XCTAssertEqualObjects(ch.sent.lastObject.length ? [ch.sent.lastObject subdataWithRange:NSMakeRange(1, 2)] : nil,
+                          HEX(@"06 0c"));
+}
+
+- (HBAVDTPSession *)sessionOpeningChannels:(NSArray<HBFakeSignalingChannel *> *)channels opens:(int *)opens {
+    __block int n = 0;
+    int *counter = opens;
+    HBAVDTPSession *s = [[HBAVDTPSession alloc] initWithSignalingOpener:^(void (^done)(HBL2CAPChannel *, NSInteger)) {
+        HBFakeSignalingChannel *ch = n < (int)channels.count ? channels[n] : nil;
+        n++;
+        if (counter) *counter = n;
+        done(ch, ch ? 0 : 5);
+    } transportProvider:^(void (^done)(int)) {
+        int tv[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tv);
+        close(tv[1]);
+        done(tv[0]);
+    }];
+    s.negotiationRetryInterval = 0.05;
+    return s;
+}
+
+- (void)testOpenRejectedWithBadStateRetriesNegotiation {
+    NSMutableArray<NSNumber *> *peers = [NSMutableArray array];
+    HBFakeSignalingChannel *first = [self newFakeChannelKeepingPeerIn:peers];
+    HBFakeSignalingChannel *second = [self newFakeChannelKeepingPeerIn:peers];
+    int opens = 0;
+    HBAVDTPSession *s = [self sessionOpeningChannels:@[ first, second ] opens:&opens];
+    HBSessionRecorder *rec = [HBSessionRecorder new];
+    s.delegate = rec;
+
+    [s startWithSampleRateBit:0x10];
+    [self negotiateUpToOpenOn:first];
+    Answer(first, 3, @"31");                                          // OPEN rejected: BAD_STATE
+    XCTAssertEqual(SignalOf(first.sent.lastObject), HBAVDTPAbort, @"the configured stream is aborted");
+    XCTAssertEqualObjects([first.sent.lastObject subdataWithRange:NSMakeRange(2, 1)], HEX(@"0c"));
+    XCTAssertEqual(first.socketFD, -1, @"the signaling channel is closed");
+    XCTAssertNotEqual(s.state, HBSessionFailed);
+    XCTAssertEqual(opens, 1, @"the reopen waits for the retry delay");
+
+    [self spinUntil:^BOOL { return second.sent.count > 0; } timeout:2];
+    XCTAssertEqual(opens, 2);
+    [self negotiateUpToOpenOn:second];
+    Answer(second, 2, @"");                                           // OPEN accepted → transport → START
+    XCTAssertEqual(SignalOf(second.sent.lastObject), HBAVDTPStart);
+    Answer(second, 2, @"");
+    XCTAssertEqual(s.state, HBSessionStreaming);
+    XCTAssertNil(rec.lastError);
+    XCTAssertEqualObjects(rec.states, (@[ @(HBSessionConnecting), @(HBSessionConfigured), @(HBSessionConnecting),
+                                          @(HBSessionConfigured), @(HBSessionStreaming) ]));
+    s = nil;
+    for (NSNumber *fd in peers) close(fd.intValue);
+}
+
+- (void)testSetupRejectsBeyondRetryLimitFail {
+    NSMutableArray<NSNumber *> *peers = [NSMutableArray array];
+    HBFakeSignalingChannel *first = [self newFakeChannelKeepingPeerIn:peers];
+    HBFakeSignalingChannel *second = [self newFakeChannelKeepingPeerIn:peers];
+    HBAVDTPSession *s = [self sessionOpeningChannels:@[ first, second ] opens:NULL];
+    s.maxNegotiationRetries = 1;
+    HBSessionRecorder *rec = [HBSessionRecorder new];
+    s.delegate = rec;
+
+    [s startWithSampleRateBit:0x10];
+    [self negotiateUpToOpenOn:first];
+    Answer(first, 3, @"31");
+    [self spinUntil:^BOOL { return second.sent.count > 0; } timeout:2];
+    [self negotiateUpToOpenOn:second];
+    Answer(second, 3, @"31");
+    XCTAssertEqual(s.state, HBSessionFailed);
+    XCTAssertEqual(rec.lastError.code, HBErrorSinkRejected);
+    s = nil;
+    for (NSNumber *fd in peers) close(fd.intValue);
+}
+
+- (void)testSetupRejectWithoutWayToReopenFails {
+    [_session startWithSampleRateBit:0x10];
+    [self replyDiscoverAndCaps:YES];
+    [_fake reply:HEX(@"53 03 31")];                                   // SET_CONFIGURATION rejected
+    XCTAssertEqual(_session.state, HBSessionFailed);
+    XCTAssertEqual(_recorder.lastError.code, HBErrorSinkRejected);
+}
+
 @end

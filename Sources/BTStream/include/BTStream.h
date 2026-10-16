@@ -147,6 +147,12 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 @property NSTimeInterval openRetryInterval;
 /// Signaling-open attempts before Failed HBErrorChannelOpenFailed (default 10).
 @property NSInteger maxOpenAttempts;
+/// A reject of SET_CONFIGURATION, OPEN or START during setup (e.g. BAD_STATE while bluetoothd's own A2DP connect
+/// races ours) restarts the negotiation: ABORT, close the signaling channel, wait negotiationRetryInterval
+/// (default 2 s), then a fresh round of signaling-open attempts and DISCOVER. Up to maxNegotiationRetries
+/// (default 3) restarts, then Failed HBErrorSinkRejected. Needs a way to reopen (device or opener init).
+@property NSTimeInterval negotiationRetryInterval;
+@property NSInteger maxNegotiationRetries;
 /// Called on the main queue with every session log line (also sent to os_log, subsystem HiResBuddy).
 @property(copy, nullable) void (^logHandler)(NSString *message);
 /// Full path to Streaming: if the device is connected, takeover (closeConnection, first attempt 1 s later). Then
@@ -154,7 +160,7 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 /// openConnection and wait for it (connectionComplete or isConnected, at most 10 s); then open PSM 0x19 with a
 /// signalingOpenTimeout deadline (a channel arriving after its deadline is closed). Then DISCOVER,
 /// GET_CAPABILITIES until a sink offers LDAC at sfBit in stereo, SET_CONFIGURATION, OPEN, transport, START.
-/// Only from Idle.
+/// A reject of the last three restarts the negotiation (see negotiationRetryInterval). Only from Idle.
 - (void)startWithSampleRateBit:(uint8_t)sfBit;
 /// Streaming -> Suspended (SUSPEND) and back (START).
 - (void)suspend;
