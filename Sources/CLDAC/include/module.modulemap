@@ -1,0 +1,4 @@
+module CLDAC {
+    header "ldacBT.h"
+    export *
+}

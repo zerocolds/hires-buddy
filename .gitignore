@@ -8,3 +8,4 @@ spike/conn
 media/
 *.wav
 .DS_Store
+.build/
