@@ -1,0 +1,10 @@
+player/ldacplay
+player/l2test
+player/cbtest
+spike/ldacspike
+spike/ldacwait
+spike/disc
+spike/conn
+media/
+*.wav
+.DS_Store
