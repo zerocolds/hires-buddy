@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "LDACEncoder", targets: ["LDACEncoder"]),
         .library(name: "BTStream", targets: ["BTStream"]),
+        .library(name: "HiResBuddyCore", targets: ["HiResBuddyCore"]),
     ],
     targets: [
         .target(
@@ -33,5 +34,7 @@ let package = Package(
         // Test-only stand-in for the helper (no Bluetooth); deliberately not a product.
         .executableTarget(name: "fake-transport", path: "Tests/fake-transport"),
         .testTarget(name: "BTStreamTests", dependencies: ["BTStream", "fake-transport"], path: "Tests/BTStreamTests"),
+        .target(name: "HiResBuddyCore", dependencies: ["LDACEncoder", "BTStream"]),
+        .testTarget(name: "HiResBuddyCoreTests", dependencies: ["HiResBuddyCore", "LDACEncoder"]),
     ]
 )
