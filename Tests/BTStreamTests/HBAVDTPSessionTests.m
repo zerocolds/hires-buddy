@@ -1,4 +1,5 @@
 #import <XCTest/XCTest.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #import "BTStream.h"
@@ -34,6 +35,9 @@ static uint8_t SignalOf(NSData *msg) { return msg.length > 1 ? ((const uint8_t *
 @interface HBSessionRecorder : NSObject <HBAVDTPSessionDelegate>
 @property(strong) NSMutableArray<NSNumber *> *states;
 @property(strong, nullable) NSError *lastError;
+@property(copy, nullable) void (^onState)(HBAVDTPSession *s, HBSessionState state);
+@property int transportFDAtCallback;
+@property BOOL transportFDOpenAtCallback;
 @end
 
 @implementation HBSessionRecorder
@@ -41,6 +45,9 @@ static uint8_t SignalOf(NSData *msg) { return msg.length > 1 ? ((const uint8_t *
 - (void)session:(HBAVDTPSession *)s didChangeState:(HBSessionState)state error:(NSError *)err {
     [self.states addObject:@(state)];
     if (err) self.lastError = err;
+    self.transportFDAtCallback = s.transportFD;
+    self.transportFDOpenAtCallback = s.transportFD >= 0 && fcntl(s.transportFD, F_GETFD) != -1;
+    if (self.onState) self.onState(s, state);
 }
 @end
 
@@ -144,7 +151,70 @@ static uint8_t SignalOf(NSData *msg) { return msg.length > 1 ? ((const uint8_t *
     XCTAssertEqual(_session.state, HBSessionFailed);
     XCTAssertEqualObjects(_recorder.lastError.domain, HBErrorDomain);
     XCTAssertEqual(_recorder.lastError.code, HBErrorSinkDisconnected);
+    // still usable while the delegate hears about it, closed right after
+    XCTAssertEqual(_recorder.transportFDAtCallback, _providedFD);
+    XCTAssertTrue(_recorder.transportFDOpenAtCallback);
     XCTAssertEqual(_session.transportFD, -1);
+    XCTAssertEqual(fcntl(_providedFD, F_GETFD), -1);
+}
+
+- (void)testSinkCloseWhileStreamingFails {
+    [self driveToStreaming];
+    [_fake reply:HEX(@"00 08 0c")];
+    XCTAssertEqualObjects(_fake.sent.lastObject, HEX(@"02 08"));
+    XCTAssertEqual(_session.state, HBSessionFailed);
+    XCTAssertEqual(_recorder.lastError.code, HBErrorSinkDisconnected);
+}
+
+- (void)testSinkSuspendAndStartAreApplied {
+    [self driveToStreaming];
+    [_fake reply:HEX(@"00 09 0c")];
+    XCTAssertEqual(_session.state, HBSessionSuspended);
+    [_fake reply:HEX(@"10 07 0c")];
+    XCTAssertEqual(_session.state, HBSessionStreaming);
+    XCTAssertEqualObjects(_fake.sent.lastObject, HEX(@"12 07"));
+}
+
+- (void)testResponsesWithWrongLabelAreIgnored {
+    [_session startWithSampleRateBit:0x10];               // DISCOVER goes out with label 1
+    [_fake reply:HEX(@"52 01 04 08 08 08")];               // accept, label 5
+    XCTAssertEqual(_fake.sent.count, 1);
+    [_fake reply:HEX(@"53 01 31")];                        // reject, label 5
+    XCTAssertEqual(_session.state, HBSessionConnecting);
+    XCTAssertNil(_recorder.lastError);
+    [_fake reply:HEX(@"12 01 04 08 08 08")];
+    XCTAssertEqual(SignalOf(_fake.sent.lastObject), HBAVDTPGetCapabilities);
+}
+
+- (void)testStopInsideConnectingCallbackHaltsSetup {
+    __block int restored = 0;
+    _session.restoreHook = ^{ restored++; };
+    _recorder.onState = ^(HBAVDTPSession *s, HBSessionState state) {
+        if (state == HBSessionConnecting) [s stopAndRestoreSystemAudio];
+    };
+    [_session startWithSampleRateBit:0x10];
+    XCTAssertEqual(_fake.sent.count, 0);
+    XCTAssertEqual(_session.state, HBSessionClosed);
+    XCTAssertEqual(restored, 1);
+}
+
+- (void)testSilentSinkTimesOut {
+    _session.transactionTimeout = 0.05;
+    [_session startWithSampleRateBit:0x10];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:2];
+    while (_session.state == HBSessionConnecting && deadline.timeIntervalSinceNow > 0)
+        [NSRunLoop.mainRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    XCTAssertEqual(_session.state, HBSessionFailed);
+    XCTAssertEqual(_recorder.lastError.code, HBErrorTimeout);
+}
+
+- (void)testLDACEndpointWithoutRequestedRateIsSkipped {
+    [_session startWithSampleRateBit:0x02];               // 176.4 kHz: the XM4's LDAC caps (0x3c) lack it
+    [self replyDiscoverAndCaps:YES];
+    for (NSString *label in @[ @"5", @"6", @"7" ])         // endpoints 4..6: SBC only
+        [_fake reply:HEX([label stringByAppendingString:@"2 02 01 00 07 06 00 00 ff ff 02 35"])];
+    XCTAssertEqual(_session.state, HBSessionFailed);
+    XCTAssertEqual(_recorder.lastError.code, HBErrorNoLDAC);
 }
 
 - (void)testStopSendsSuspendCloseAndReconnects {

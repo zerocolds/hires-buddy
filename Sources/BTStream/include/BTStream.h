@@ -88,10 +88,11 @@ extern NSErrorDomain const HBErrorDomain;
 /// Named HBSessionError (not HBError) so it does not clash with a Swift-side HBError in HiResBuddyCore.
 typedef NS_ERROR_ENUM(HBErrorDomain, HBSessionError) {
     HBErrorSinkRejected = 1,        // sink answered a setup command with a reject
-    HBErrorNoLDAC = 2,              // no free sink endpoint reports LDAC
-    HBErrorSinkDisconnected = 3,    // signaling channel closed under us
+    HBErrorNoLDAC = 2,              // no free sink endpoint offers LDAC at the requested rate in stereo
+    HBErrorSinkDisconnected = 3,    // signaling channel closed or unwritable, or the sink sent CLOSE/ABORT
     HBErrorChannelOpenFailed = 4,   // signaling channel could not be opened (after retries)
     HBErrorTransportFailed = 5,     // helper could not hand over the transport channel
+    HBErrorTimeout = 6,             // sink did not answer a command within transactionTimeout
 };
 
 typedef NS_ENUM(NSInteger, HBSessionState) {
@@ -107,7 +108,7 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 @class HBAVDTPSession;
 
 @protocol HBAVDTPSessionDelegate <NSObject>
-/// Main queue. `err` is set only for HBSessionFailed.
+/// Main queue. `err` is set only for HBSessionFailed. For Failed/Closed the restore hook (if due) has already run.
 - (void)session:(HBAVDTPSession *)s didChangeState:(HBSessionState)state error:(nullable NSError *)err;
 @end
 
@@ -121,23 +122,29 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 - (instancetype)init NS_UNAVAILABLE;
 @property(weak, nullable) id<HBAVDTPSessionDelegate> delegate;
 @property(readonly) HBSessionState state;
-/// Valid in Streaming/Suspended, -1 otherwise. Owned by the session (closed on stop/failure).
+/// Valid in Streaming/Suspended, -1 otherwise. Owned by the session: on Failed/Closed it stays open until the
+/// delegate callback returns and is closed right after — stop writing to it inside that callback.
 @property(readonly) int transportFD;
 /// 0 when unknown (the helper hands over a bare fd).
 @property(readonly) uint16_t transportMTU;
 /// The LDAC sample-rate bit accepted by the sink; 0 before SET_CONFIGURATION is accepted.
 @property(readonly) uint8_t negotiatedSampleRateBit;
-/// Runs at the end of stopAndRestoreSystemAudio so macOS takes A2DP back. Default (device init): closeConnection,
-/// then openConnection 1.5 s later; nil for the test init.
+/// Gives A2DP back to macOS; runs at most once, before the Closed/Failed callback: on stopAndRestoreSystemAudio,
+/// and on any failure after a takeover. Default (device init): closeConnection (off the main queue), then
+/// openConnection 1.5 s later; nil for the test init.
 @property(copy, nullable) void (^restoreHook)(void);
+/// Deadline for each sink answer during setup/suspend/resume (default 5 s) -> Failed HBErrorTimeout.
+@property NSTimeInterval transactionTimeout;
 /// Full path to Streaming: takeover if the device is connected (closeConnection, then the signaling channel with
-/// up to 8 retries 2 s apart), DISCOVER, GET_CAPABILITIES until an LDAC sink, SET_CONFIGURATION, OPEN, transport, START.
+/// up to 8 retries 2 s apart), DISCOVER, GET_CAPABILITIES until a sink offers LDAC at sfBit in
+/// stereo, SET_CONFIGURATION, OPEN, transport, START.
 /// Only from Idle.
 - (void)startWithSampleRateBit:(uint8_t)sfBit;
 /// Streaming -> Suspended (SUSPEND) and back (START).
 - (void)suspend;
 - (void)resume;
-/// SUSPEND + CLOSE (each waited for at most 1 s), closes the channels, terminates the helper, then restoreHook.
+/// SUSPEND + CLOSE (each waited for at most 1 s), closes the channels, terminates the helper, runs restoreHook
+/// (unless a failure already did), then Closed.
 /// No-op when Idle or Closed.
 - (void)stopAndRestoreSystemAudio;
 @end
