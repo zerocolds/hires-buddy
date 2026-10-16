@@ -35,6 +35,15 @@ let package = Package(
         .executableTarget(name: "fake-transport", path: "Tests/fake-transport"),
         .testTarget(name: "BTStreamTests", dependencies: ["BTStream", "fake-transport"], path: "Tests/BTStreamTests"),
         .target(name: "HiResBuddyCore", dependencies: ["LDACEncoder", "BTStream"]),
+        .executableTarget(
+            name: "hiresbuddy-cli",
+            dependencies: ["HiResBuddyCore", "BTStream", "LDACEncoder"],
+            exclude: ["Info.plist"],
+            linkerSettings: [.unsafeFlags([
+                "-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
+                "-Xlinker", "Sources/hiresbuddy-cli/Info.plist",
+            ])]
+        ),
         .testTarget(name: "HiResBuddyCoreTests", dependencies: ["HiResBuddyCore", "LDACEncoder"]),
     ]
 )
