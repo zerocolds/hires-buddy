@@ -1,5 +1,6 @@
 import CoreAudio
 import Foundation
+import os
 
 /// Reads what the system plays into the "HiRes Buddy" virtual device: the driver mirrors its output to its input,
 /// and an IOProc on the input side hands the interleaved stereo Float32 blocks to the sink as the HAL delivers them.
@@ -17,6 +18,10 @@ public final class AudioCapture: PCMSource {
     private var ioProcID: AudioDeviceIOProcID?
     private var sinkBox: Unmanaged<SinkBox>?
     private var volumeListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+    private let log = Logger(subsystem: "HiResBuddy", category: "capture")
+
+    /// Why the last `start` delivered nothing (`PCMSource.start` cannot throw); nil after a successful start.
+    public private(set) var lastError: HBError?
 
     /// Finds the device and sets its nominal sample rate.
     public init(deviceName: String = AudioCapture.deviceName, sampleRate: Int) throws {
@@ -45,17 +50,27 @@ public final class AudioCapture: PCMSource {
         guard ioProcID == nil else { return }
         let box = Unmanaged.passRetained(SinkBox(sink))
         var procID: AudioDeviceIOProcID?
-        guard AudioDeviceCreateIOProcID(device, captureIOProc, box.toOpaque(), &procID) == noErr, let procID else {
+        var status = AudioDeviceCreateIOProcID(device, captureIOProc, box.toOpaque(), &procID)
+        guard status == noErr, let procID else {
             box.release()
+            fail("AudioDeviceCreateIOProcID", status)
             return
         }
-        guard AudioDeviceStart(device, procID) == noErr else {
+        status = AudioDeviceStart(device, procID)
+        guard status == noErr else {
             AudioDeviceDestroyIOProcID(device, procID)
             box.release()
+            fail("AudioDeviceStart", status)
             return
         }
         ioProcID = procID
         sinkBox = box
+        lastError = nil
+    }
+
+    private func fail(_ call: String, _ status: OSStatus) {
+        lastError = .coreAudio(status)
+        log.error("\(call, privacy: .public) failed: \(status)")
     }
 
     /// Returns once the IOProc has stopped; the sink is not called afterwards.

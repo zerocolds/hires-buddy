@@ -1,94 +1,82 @@
 import CoreAudio
 import Foundation
+import os
 
 public enum OutputDeviceError: Error, Equatable {
     case coreAudio(OSStatus)
 }
 
 /// Switches the system default output device and puts it back afterwards (CoreAudio HAL).
+///
+/// The previous device is remembered by UID, not object id: Bluetooth headphones disappear from CoreAudio while
+/// the stream owns them and come back as a new object. If the previous device is absent at `restore`, a fallback
+/// output (built-in first) is made default and the previous one stays remembered, so a later `restore` — once the
+/// headphones are back — still puts the real one back.
 public final class OutputDeviceSwitcher {
-    private var previous: AudioDeviceID?
+    public enum RestoreResult: Equatable {
+        /// The remembered device is default again (its name); nothing is remembered any more.
+        case restored(String)
+        /// The remembered device is absent; this device (its name) was made default instead.
+        case fallback(String)
+        /// Nothing remembered, or no usable output exists.
+        case nothingToRestore
+    }
 
-    public init() {}
+    private struct Remembered {
+        var uid: String
+        var name: String
+    }
 
-    /// First device whose name equals `name`, nil if none.
+    private let directory: AudioDeviceDirectory
+    private var previous: Remembered?
+    private let log = Logger(subsystem: "HiResBuddy", category: "output")
+
+    public convenience init() { self.init(directory: CoreAudioDeviceDirectory()) }
+
+    init(directory: AudioDeviceDirectory) { self.directory = directory }
+
+    /// First output device whose name equals `name`, nil if none.
     public func deviceID(named name: String) -> AudioDeviceID? {
-        let matches = allDevices().filter { deviceName($0) == name }
-        return matches.first { hasOutputStreams($0) } ?? matches.first
+        directory.outputDevices().first { $0.name == name }?.id
     }
 
     /// The current default output device; `kAudioObjectUnknown` if there is none.
-    public func current() -> AudioDeviceID {
-        var id = AudioDeviceID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var address = Self.defaultOutputAddress
-        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id)
-        return status == noErr ? id : AudioDeviceID(kAudioObjectUnknown)
-    }
+    public func current() -> AudioDeviceID { directory.currentDefaultOutput() }
 
-    /// Makes `id` the default output; the device that was default before the first call is remembered for `restore`.
+    /// Makes `id` the default output. The device that was default before the first call is remembered for
+    /// `restore` — unless that was HiRes Buddy itself (left over from a crash): then the fallback output is.
     public func switchTo(_ id: AudioDeviceID) throws {
-        if previous == nil { previous = current() }
-        try setDefault(id)
-    }
-
-    /// Puts the remembered device back if it still exists; otherwise does nothing.
-    public func restore() throws {
-        guard let previous else { return }
-        guard previous != kAudioObjectUnknown, allDevices().contains(previous) else {
-            self.previous = nil
-            return
+        if previous == nil {
+            let devices = directory.outputDevices()
+            let cur = current()
+            if let info = devices.first(where: { $0.id == cur }), info.name != AudioCapture.deviceName {
+                previous = Remembered(uid: info.uid, name: info.name)
+            } else if let fb = Self.fallback(in: devices) {
+                previous = Remembered(uid: fb.uid, name: fb.name)
+            }
         }
-        try setDefault(previous)
-        self.previous = nil
+        try directory.setDefaultOutput(id)
     }
 
-    private static var defaultOutputAddress: AudioObjectPropertyAddress {
-        AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
+    /// Puts the remembered device back, or a fallback output while it is absent (see the type's comment).
+    @discardableResult
+    public func restore() throws -> RestoreResult {
+        guard let previous else { return .nothingToRestore }
+        let devices = directory.outputDevices()
+        if let info = devices.first(where: { $0.uid == previous.uid }) {
+            try directory.setDefaultOutput(info.id)
+            self.previous = nil
+            return .restored(info.name)
+        }
+        guard let fb = Self.fallback(in: devices) else { return .nothingToRestore }
+        try directory.setDefaultOutput(fb.id)
+        log.info("previous output \(previous.name, privacy: .public) absent, fell back to \(fb.name, privacy: .public)")
+        return .fallback(fb.name)
     }
 
-    private func setDefault(_ id: AudioDeviceID) throws {
-        var id = id
-        var address = Self.defaultOutputAddress
-        let status = AudioObjectSetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &id)
-        if status != noErr { throw OutputDeviceError.coreAudio(status) }
-    }
-
-    private func allDevices() -> [AudioDeviceID] {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr
-        else { return [] }
-        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &ids) == noErr
-        else { return [] }
-        return ids
-    }
-
-    private func hasOutputStreams(_ id: AudioDeviceID) -> Bool {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreams,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain)
-        var size: UInt32 = 0
-        return AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr && size > 0
-    }
-
-    private func deviceName(_ id: AudioDeviceID) -> String? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyName,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var name: Unmanaged<CFString>?
-        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &name) == noErr, let name else { return nil }
-        return name.takeRetainedValue() as String
+    /// Built-in output first, else any output that is not HiRes Buddy.
+    private static func fallback(in devices: [AudioDeviceInfo]) -> AudioDeviceInfo? {
+        let real = devices.filter { $0.name != AudioCapture.deviceName }
+        return real.first { $0.isBuiltIn } ?? real.first
     }
 }

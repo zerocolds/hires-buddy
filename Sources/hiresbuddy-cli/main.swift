@@ -112,10 +112,18 @@ if let wavPath {
                  AudioCapture.deviceName, sampleRate.rawValue, device.name ?? "?", address, "\(quality)"))
 }
 
-/// Puts the previous default output back (system mode); safe to call more than once.
+/// Puts the previous default output back (system mode); safe to call more than once. Called as soon as the stream
+/// ends (the headphones' output device is gone then, so this usually lands on the fallback output) and again once
+/// they have reconnected, so the real previous device wins when it is back.
 @MainActor func restoreOutput() {
     guard let s = switcher else { return }
-    do { try s.restore() } catch { printError("cannot restore the default output: \(error)") }
+    do {
+        switch try s.restore() {
+        case .restored(let name): printError("output restored to \(name)")
+        case .fallback(let name): printError("previous output absent for now, output on \(name)")
+        case .nothingToRestore: break
+        }
+    } catch { printError("cannot restore the default output: \(error)") }
 }
 
 let session = HBAVDTPSession(device: device, helper: HBTransportHelperClient())
@@ -175,13 +183,37 @@ streamer.onStats = { s in
             let connected = device.isConnected()
             if sawDisconnect && connected {
                 printError("reconnected")
-                exit(code)
+                restoreAfterReconnect(code)
+                return
             }
             if checksLeft == 0 {
                 printError("headphones did not reconnect within \(seconds) s")
+                restoreOutput()
                 exit(code)
             }
             waitForReconnect(code, sawDisconnect: sawDisconnect || !connected, checksLeft: checksLeft - 1, seconds: seconds)
+        }
+    }
+
+    /// The headphones' CoreAudio output device appears a moment after the link is back: retry the restore for up
+    /// to 5 s while only the fallback is available.
+    private func restoreAfterReconnect(_ code: Int32, triesLeft: Int = 10) {
+        guard let s = switcher, triesLeft > 0 else { exit(code) }
+        do {
+            switch try s.restore() {
+            case .restored(let name):
+                printError("output restored to \(name)")
+                exit(code)
+            case .fallback:
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+                    restoreAfterReconnect(code, triesLeft: triesLeft - 1)
+                }
+            case .nothingToRestore:
+                exit(code)
+            }
+        } catch {
+            printError("cannot restore the default output: \(error)")
+            exit(code)
         }
     }
 }
@@ -204,10 +236,14 @@ wav?.onEnd = {
     DispatchQueue.main.async { MainActor.assumeIsolated { playback.stop("end of file") } }
 }
 
-signal(SIGINT, SIG_IGN)
-let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-sigint.setEventHandler { MainActor.assumeIsolated { playback.stop("interrupted, stopping") } }
-sigint.resume()
+// SIGINT (Ctrl-C), SIGTERM (kill) and SIGHUP (terminal closed) all take the same stop path.
+let signalSources = [SIGINT, SIGTERM, SIGHUP].map { sig in
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler { MainActor.assumeIsolated { playback.stop("signal \(sig), stopping") } }
+    source.resume()
+    return source
+}
 
 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
     MainActor.assumeIsolated {
