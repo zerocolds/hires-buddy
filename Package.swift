@@ -22,6 +22,16 @@ let package = Package(
             name: "BTStream",
             linkerSettings: [.linkedFramework("IOBluetooth"), .linkedFramework("CoreBluetooth")]
         ),
-        .testTarget(name: "BTStreamTests", dependencies: ["BTStream"], path: "Tests/BTStreamTests"),
+        .executableTarget(
+            name: "hiresbuddy-transport",
+            dependencies: ["BTStream"],
+            linkerSettings: [.unsafeFlags([
+                "-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
+                "-Xlinker", "Sources/hiresbuddy-transport/Info.plist",
+            ])]
+        ),
+        // Test-only stand-in for the helper (no Bluetooth); deliberately not a product.
+        .executableTarget(name: "fake-transport", path: "Tests/fake-transport"),
+        .testTarget(name: "BTStreamTests", dependencies: ["BTStream", "fake-transport"], path: "Tests/BTStreamTests"),
     ]
 )

@@ -69,4 +69,19 @@ typedef NS_ENUM(uint8_t, HBAVDTPSignal) {
 - (void)close;
 @end
 
+/// Opens the AVDTP transport channel in a separate helper process (bluetoothd allows one channel per PSM per
+/// client session) and receives its socket over a unix socket with SCM_RIGHTS.
+/// Wire format on the unix socket, one message: [status: 1 = ok, 0 = fail][int32 code, host order], plus the fd as
+/// SCM_RIGHTS when ok. Helper stdin: "OPEN <addr> <psm>\n"; it lives until stdin reaches EOF.
+@interface HBTransportHelperClient : NSObject
+/// Default helper: `hiresbuddy-transport` next to the main bundle's executable.
+- (instancetype)init;
+- (instancetype)initWithHelperURL:(NSURL *)helper NS_DESIGNATED_INITIALIZER;
+/// Completion on the main queue: fd >= 0 and code 0 on success; fd -1 and the helper's code on failure
+/// (-1 when the helper died, timed out after 15 s, was terminated, or could not be started).
+- (void)openTransportForAddress:(NSString *)addr psm:(uint16_t)psm completion:(void (^)(int fd, NSInteger code))completion;
+/// Kills the helper (closing its channel) and removes the socket path. Safe to call repeatedly.
+- (void)terminate;
+@end
+
 NS_ASSUME_NONNULL_END
