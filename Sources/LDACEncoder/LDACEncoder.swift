@@ -28,8 +28,8 @@ public struct LDACPacket: Sendable {
 
 public enum LDACEncoderError: Error, Equatable {
     case handleAllocationFailed
-    case initFailed
-    case setQualityFailed
+    case initFailed(code: Int)
+    case setQualityFailed(code: Int)
     case wrongBlockSize(samples: Int)
     case encodeFailed(code: Int)
 }
@@ -50,8 +50,9 @@ public final class LDACEncoder {
             h, Int32(mtu), Int32(quality.rawValue), Int32(LDACBT_CHANNEL_MODE_STEREO),
             LDACBT_SMPL_FMT_F32, Int32(sampleRate.rawValue))
         guard rc == 0 else {
+            let code = Int(ldacBT_get_error_code(h))
             ldacBT_free_handle(h)
-            throw LDACEncoderError.initFailed
+            throw LDACEncoderError.initFailed(code: code)
         }
         handle = h
         self.sampleRate = sampleRate
@@ -64,14 +65,20 @@ public final class LDACEncoder {
         ldacBT_free_handle(handle)
     }
 
+    /// Best-effort convenience: a failed switch is silently ignored (the getter keeps
+    /// reporting the previous quality). Use `setQuality(_:)` when the error matters.
     public var quality: LDACQuality {
         get { currentQuality }
-        set {
-            guard newValue != currentQuality else { return }
-            if ldacBT_set_eqmid(handle, Int32(newValue.rawValue)) == 0 {
-                currentQuality = newValue
-            }
+        set { try? setQuality(newValue) }
+    }
+
+    /// Switches quality on the fly; throws with libldac's error code on failure.
+    public func setQuality(_ newValue: LDACQuality) throws {
+        guard newValue != currentQuality else { return }
+        guard ldacBT_set_eqmid(handle, Int32(newValue.rawValue)) == 0 else {
+            throw LDACEncoderError.setQualityFailed(code: Int(ldacBT_get_error_code(handle)))
         }
+        currentQuality = newValue
     }
 
     /// Samples per channel in one LDAC frame: 128 up to 48 kHz, 256 at 88.2/96 kHz.

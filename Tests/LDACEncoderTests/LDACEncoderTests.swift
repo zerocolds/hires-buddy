@@ -60,7 +60,17 @@ final class LDACEncoderTests: XCTestCase {
     func testRejectsWrongBlockSize() throws {
         let enc = try LDACEncoder(sampleRate: .hz44100, quality: .sq)
         let short = [Float](repeating: 0, count: 200) // 100 frames
-        XCTAssertThrowsError(try short.withUnsafeBufferPointer { try enc.encode($0) })
+        XCTAssertThrowsError(try short.withUnsafeBufferPointer { try enc.encode($0) }) {
+            XCTAssertEqual($0 as? LDACEncoderError, .wrongBlockSize(samples: 200))
+        }
+    }
+
+    func testSetQualitySucceedsForAllQualities() throws {
+        let enc = try LDACEncoder(sampleRate: .hz48000, quality: .hq)
+        for q in LDACQuality.allCases + [.hq] {
+            try enc.setQuality(q)
+            XCTAssertEqual(enc.quality, q)
+        }
     }
 
     func testSamplesPerFrameAndAvdtpBits() throws {
