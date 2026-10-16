@@ -64,13 +64,17 @@ streamer.onStats = { s in
 }
 
 /// Ctrl-C / end of file → stop, then exit once Closed arrives and the restore hook (closeConnection, then
-/// openConnection 1.5 s later) has had time to give A2DP back to macOS.
+/// openConnection 1.5 s later) has brought the headphones back: an IOBluetooth connect still pending when the
+/// process exits is cancelled, which would leave them disconnected.
 @MainActor final class Playback {
     private let streamer: Streamer
+    private let device: IOBluetoothDevice
     private var stopping = false
+    private var ended = false
 
-    init(streamer: Streamer) {
+    init(streamer: Streamer, device: IOBluetoothDevice) {
         self.streamer = streamer
+        self.device = device
     }
 
     func stop(_ reason: String) {
@@ -78,14 +82,34 @@ streamer.onStats = { s in
         stopping = true
         printError(reason)
         streamer.stop()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { die("no Closed within 3 s, exiting", code: 0) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [self] in
+            if !ended { die("no Closed within 3 s, exiting", code: 0) }
+        }
     }
 
     func sessionEnded(_ code: Int32) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { exit(code) }
+        ended = true
+        printError("waiting for the headphones to reconnect to macOS…")
+        waitForReconnect(code, sawDisconnect: false, checksLeft: 60)
+    }
+
+    /// The restore hook drops the link first, so "reconnected" means connected after having been seen disconnected.
+    private func waitForReconnect(_ code: Int32, sawDisconnect: Bool, checksLeft: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [self] in
+            let connected = device.isConnected()
+            if sawDisconnect && connected {
+                printError("reconnected")
+                exit(code)
+            }
+            if checksLeft == 0 {
+                printError("headphones did not reconnect within 15 s")
+                exit(code)
+            }
+            waitForReconnect(code, sawDisconnect: sawDisconnect || !connected, checksLeft: checksLeft - 1)
+        }
     }
 }
-let playback = Playback(streamer: streamer)
+let playback = Playback(streamer: streamer, device: device)
 
 let stateNames: [HBSessionState: String] = [
     .idle: "idle", .connecting: "connecting", .configured: "configured", .streaming: "streaming",
