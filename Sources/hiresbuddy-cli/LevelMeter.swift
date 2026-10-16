@@ -21,6 +21,10 @@ final class LevelMeter: PCMSource {
 
     func stop() { source.stop() }
 
+    var startError: (any Error)? { source.startError }
+
+    func onFailure(_ handler: @escaping @MainActor (any Error) -> Void) { source.onFailure(handler) }
+
     func takePeakDBFS() -> Double {
         let peak = Float(bitPattern: peakBits.exchange(0, ordering: .relaxed))
         return peak > 0 ? 20 * log10(Double(peak)) : -.infinity

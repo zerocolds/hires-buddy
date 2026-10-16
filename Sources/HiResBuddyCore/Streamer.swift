@@ -17,6 +17,9 @@ public struct StreamStats: Sendable {
     public var backpressureTicks: Int
     /// Source blocks dropped because the input ring was full (the source delivered faster than it is drained).
     public var inputOverflows: Int
+    /// PCM frames (per channel) thrown away: drained unencoded while suspended, or trimmed from the head of the
+    /// send queue by its cap.
+    public var discardedFrames: Int
 }
 
 /// Delivers interleaved stereo Float32 in blocks of any size, from any thread (also a real-time one: the
@@ -24,6 +27,15 @@ public struct StreamStats: Sendable {
 public protocol PCMSource: AnyObject {
     func start(_ sink: @escaping (UnsafeBufferPointer<Float>) -> Void)
     func stop()
+    /// Why the last `start` delivers nothing (`start` cannot throw); nil after a successful start.
+    var startError: (any Error)? { get }
+    /// `handler` is called on the main queue if the source fails after a successful start (nothing more comes).
+    func onFailure(_ handler: @escaping @MainActor (any Error) -> Void)
+}
+
+public extension PCMSource {
+    var startError: (any Error)? { nil }
+    func onFailure(_ handler: @escaping @MainActor (any Error) -> Void) {}
 }
 
 /// What the stream pipeline needs from an LDAC encoder (lets tests inject a spy).
@@ -59,6 +71,10 @@ public final class Streamer {
     /// Once per second while streaming.
     public var onStats: ((StreamStats) -> Void)?
     /// Every session state change; `error` is set for `.failed`. The pipeline is already stopped for Failed/Closed.
+    /// When the Streamer ends the stream itself — the source did not start or failed, or the transport died — it
+    /// stops the session (giving the headphones back) and reports `.failed` with that cause instead of `.closed`
+    /// (`StreamFailure`, or HBErrorDomain/HBErrorSinkDisconnected for a dead transport); a `.streaming` that the
+    /// failure cut short is not reported.
     public var onStateChange: ((HBSessionState, Error?) -> Void)?
 
     private let session: HBAVDTPSession
@@ -68,6 +84,9 @@ public final class Streamer {
     private var source: PCMSource?
     private var engine: StreamEngine?
     private var activity: NSObjectProtocol?
+    /// Why the Streamer ended the stream itself; nil otherwise.
+    private var failure: Error?
+    private let log = Logger(subsystem: "HiResBuddy", category: "stream")
 
     public convenience init(session: HBAVDTPSession, sampleRate: LDACSampleRate, quality: LDACQuality) {
         self.init(session: session, sampleRate: sampleRate, quality: quality,
@@ -82,7 +101,7 @@ public final class Streamer {
         self.makeEncoder = makeEncoder
         stats = StreamStats(packets: 0, dropEvents: 0, bitrateKbps: 0, sampleRate: sampleRate.rawValue,
                             quality: quality, uptime: 0, bufferSeconds: 0, writeErrors: 0,
-                            backpressureTicks: 0, inputOverflows: 0)
+                            backpressureTicks: 0, inputOverflows: 0, discardedFrames: 0)
     }
 
     /// Starts the session; the source is started once the session reports Streaming.
@@ -92,6 +111,14 @@ public final class Streamer {
         engine.gain = max(0, min(1, gain))
         engine.onStats = { [weak self] s in
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.publish(s) } }
+        }
+        engine.onTransportDead = { [weak self] why in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self?.fail(NSError(domain: HBErrorDomain, code: HBSessionError.errorSinkDisconnected.rawValue,
+                                       userInfo: [NSLocalizedDescriptionKey: why]))
+                }
+            }
         }
         self.engine = engine
         self.source = source
@@ -113,22 +140,42 @@ public final class Streamer {
     private func sessionChanged(_ state: HBSessionState, _ err: Error?) {
         switch state {
         case .streaming:
+            guard failure == nil else { return }
             guard let engine, let source else { break }
             if engine.isRunning {
                 engine.queue.sync { engine.setPaused(false) }   // back from Suspended
             } else {
                 engine.queue.sync { engine.start(fd: session.transportFD) }
                 let ring = engine.input
+                source.onFailure { [weak self] error in self?.fail(StreamFailure.sourceFailed(error)) }
                 source.start { block in ring.write(block) }   // drained by the engine's send timer
+                if let error = source.startError {
+                    fail(StreamFailure.captureFailed(error))
+                    return   // not streaming after all: the session stop above reports the failure
+                }
             }
         case .suspended:
             if let engine { engine.queue.sync { engine.setPaused(true) } }
         case .failed, .closed:
             stopPipeline()   // synchronously: the transport fd is closed right after this callback
+            if let failure {
+                onStateChange?(.failed, failure)
+                return
+            }
         default:
-            break
+            if failure != nil { return }
         }
         onStateChange?(state, err)
+    }
+
+    /// Ends the stream from this side: stops the pipeline and the session (which gives the headphones back); the
+    /// session's Closed is then reported as `.failed` with `error`. Once per stream; ignored after it ended.
+    private func fail(_ error: Error) {
+        guard failure == nil, source != nil else { return }
+        failure = error
+        log.error("stream failed: \(String(describing: error), privacy: .public)")
+        stopPipeline()
+        session.stopAndRestoreSystemAudio()
     }
 
     private func stopPipeline() {
@@ -163,12 +210,23 @@ private final class StreamEngine: @unchecked Sendable {
     let queue = DispatchQueue(label: "hiresbuddy.stream", qos: .userInteractive)
     var gain: Float = 1
     var onStats: (@Sendable (StreamStats) -> Void)?
+    /// Called on `queue`, once, when writes show the transport is gone; the engine has already stopped.
+    var onTransportDead: (@Sendable (String) -> Void)?
     private(set) var isRunning = false
 
     private static let blockSamples = LDACEncoder.framesPerBlock * 2
     private static let rtpHeaderBytes = 13   // RTP header + LDAC media payload header
     private static let leadSeconds = 0.25
+    private static let prerollSeconds = 2 * leadSeconds
+    /// Cap on queued audio in every state: the pre-roll target plus 2×lead. (Steady state holds preroll − lead; the
+    /// pacer itself drops the backlog once the sender is 2×lead late, but it is not consulted while suspended or
+    /// before the first send.)
+    private static let maxQueuedSeconds = prerollSeconds + 2 * leadSeconds
     private static let drainSamples = 4096
+    /// errno values after which a write can never succeed again.
+    private static let deadTransportErrors: Set<Int32> = [EPIPE, ECONNRESET, EBADF, ENOTCONN, ECONNREFUSED]
+    /// Back-to-back failed writes for this long also count as a dead transport.
+    private static let deadAfterFailingFor = 1.0
 
     /// Written by the source (any thread, lock-free), drained on `queue` every send tick: 2 s of stereo at 96 kHz.
     let input = PCMRingBuffer(capacity: 2 * 96_000 * 2)
@@ -197,6 +255,8 @@ private final class StreamEngine: @unchecked Sendable {
     private var backpressureTicks = 0
     private var loggedWriteError = false
     private var loggedEncodeError = false
+    private var discardedFrames = 0
+    private var failingSince: Double?   // first of the current run of failed writes
     private var windowBytes = 0
     private var windowStart = 0.0
 
@@ -206,7 +266,7 @@ private final class StreamEngine: @unchecked Sendable {
         // Transmission starts 2×lead after the first packet: lead goes out at once (the sink's cushion), and lead
         // stays queued here so that source/scheduling jitter below that is absorbed instead of reaching the sink.
         pacer = StreamPacer(sampleRate: sampleRate, samplesPerFrame: encoder.samplesPerFrame,
-                            leadSeconds: Self.leadSeconds, prerollSeconds: 2 * Self.leadSeconds,
+                            leadSeconds: Self.leadSeconds, prerollSeconds: Self.prerollSeconds,
                             now: { ProcessInfo.processInfo.systemUptime })
         scratch = [Float](repeating: 0, count: Self.blockSamples)
         drainBuffer = [Float](repeating: 0, count: Self.drainSamples)
@@ -217,6 +277,8 @@ private final class StreamEngine: @unchecked Sendable {
         // Non-blocking: a full transport must not stall this queue (stop() and the session callbacks sync onto it).
         let flags = fcntl(fd, F_GETFL)
         if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
+        var one: Int32 = 1   // a dead transport must report EPIPE, not kill the process with SIGPIPE
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         isRunning = true
         startTime = ProcessInfo.processInfo.systemUptime
         windowStart = startTime
@@ -235,14 +297,15 @@ private final class StreamEngine: @unchecked Sendable {
         queuedFrames = 0
     }
 
-    /// Suspended: nothing is written; the source keeps feeding. On resume the backlog is dropped (it is stale) and
-    /// pacing restarts with a fresh preroll.
+    /// Suspended: nothing is written or encoded; what the source keeps feeding is drained and discarded. On resume
+    /// the backlog is dropped (it is stale) and pacing restarts with a fresh preroll.
     func setPaused(_ p: Bool) {
         guard p != paused else { return }
         paused = p
         if !p {
             queued.removeAll()
             queuedFrames = 0
+            pending.removeAll(keepingCapacity: true)
             pacerStarted = false
         }
     }
@@ -274,13 +337,28 @@ private final class StreamEngine: @unchecked Sendable {
             queuedFrames += packet.frames
         }
         pending.removeFirst(offset)
+        trimQueue()
     }
 
-    /// Moves everything the source has delivered so far into the encoder (also while paused, as before).
+    /// Drops the oldest packets while more than maxQueuedSeconds of audio is queued.
+    private func trimQueue() {
+        let maxFrames = Int(Self.maxQueuedSeconds * Double(sampleRate)) / encoder.samplesPerFrame
+        while queuedFrames > maxFrames, let first = queued.first {
+            queued.removeFirst()
+            queuedFrames -= first.frames
+            discardedFrames += first.frames * encoder.samplesPerFrame
+        }
+    }
+
+    /// Moves everything the source has delivered so far into the encoder; while paused it is discarded unencoded.
     private func drainInput() {
         while true {
             let n = drainBuffer.withUnsafeMutableBufferPointer { input.read(into: $0) }
             if n == 0 { return }
+            if paused {
+                discardedFrames += n / 2
+                continue
+            }
             drainBuffer.withUnsafeBufferPointer { ingest(UnsafeBufferPointer(rebasing: $0[0..<n])) }
         }
     }
@@ -305,24 +383,40 @@ private final class StreamEngine: @unchecked Sendable {
             }
             guard due else { return }
             let written = next.rtp.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-            if written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+            let err = written < 0 ? errno : 0
+            if written < 0 && (err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS) {
                 backpressureTicks += 1   // transport full: keep the packet for the next tick
                 return
             }
             if written == next.rtp.count {
                 packets += 1
                 windowBytes += written - Self.rtpHeaderBytes
+                failingSince = nil
             } else {
                 writeErrors += 1
                 if !loggedWriteError {
-                    log.error("transport write \(written)/\(next.rtp.count) bytes, errno \(errno)")
+                    log.error("transport write \(written)/\(next.rtp.count) bytes, errno \(err)")
                     loggedWriteError = true
+                }
+                let now = ProcessInfo.processInfo.systemUptime
+                if failingSince == nil { failingSince = now }
+                if Self.deadTransportErrors.contains(err) {
+                    return transportDied("transport write failed: \(String(cString: strerror(err))) (errno \(err))")
+                }
+                if let since = failingSince, now - since >= Self.deadAfterFailingFor {
+                    return transportDied("transport writes failing for \(Self.deadAfterFailingFor) s (errno \(err))")
                 }
             }
             queued.removeFirst()
             queuedFrames -= next.frames
             framesSent += next.frames
         }
+    }
+
+    private func transportDied(_ why: String) {
+        log.error("\(why, privacy: .public): stopping the stream")
+        stop()
+        onTransportDead?(why)
     }
 
     private func reportStats() {
@@ -338,7 +432,8 @@ private final class StreamEngine: @unchecked Sendable {
             bufferSeconds: Double(queuedFrames * encoder.samplesPerFrame) / Double(sampleRate),
             writeErrors: writeErrors,
             backpressureTicks: backpressureTicks,
-            inputOverflows: input.overflows)
+            inputOverflows: input.overflows,
+            discardedFrames: discardedFrames)
         windowBytes = 0
         windowStart = now
         onStats?(s)

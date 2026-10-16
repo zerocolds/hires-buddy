@@ -11,10 +11,17 @@ import os
 ///
 /// Reading the input side needs Microphone permission for the responsible process (NSMicrophoneUsageDescription);
 /// without it the HAL delivers silence, not an error.
+///
+/// Sample rate: the device runs at all of the driver's rates (44.1–96 kHz, stage 2 needs them), so anything — Audio
+/// MIDI Setup, another app — can change it under a running stream. While capturing, a listener on the nominal rate
+/// forces it back to the configured one; if that fails, `lastError` is set and the `onFailure` handler is called.
 public final class AudioCapture: PCMSource {
     public static let deviceName = "HiRes Buddy"
 
     private let device: AudioDeviceID
+    private let sampleRate: Float64
+    private var rateListener: AudioObjectPropertyListenerBlock?
+    private var failureHandler: (@MainActor (any Error) -> Void)?
     private var ioProcID: AudioDeviceIOProcID?
     private var sinkBox: Unmanaged<SinkBox>?
     private var volumeListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
@@ -23,18 +30,59 @@ public final class AudioCapture: PCMSource {
     /// Why the last `start` delivered nothing (`PCMSource.start` cannot throw); nil after a successful start.
     public private(set) var lastError: HBError?
 
+    public var startError: (any Error)? { lastError }
+
+    public func onFailure(_ handler: @escaping @MainActor (any Error) -> Void) { failureHandler = handler }
+
+    private static var rateAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+                                   mScope: kAudioObjectPropertyScopeGlobal,
+                                   mElement: kAudioObjectPropertyElementMain)
+    }
+
     /// Finds the device and sets its nominal sample rate.
     public init(deviceName: String = AudioCapture.deviceName, sampleRate: Int) throws {
-        guard let id = OutputDeviceSwitcher().deviceID(named: deviceName) else { throw HBError.deviceNotInstalled }
+        guard let id = OutputDeviceSwitcher(directory: CoreAudioDeviceDirectory()).deviceID(named: deviceName) else { throw HBError.deviceNotInstalled }
         device = id
+        self.sampleRate = Float64(sampleRate)
         try Self.requireStereoFloatInput(id)
-        var rate = Float64(sampleRate)
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        let status = AudioObjectSetPropertyData(id, &address, 0, nil, UInt32(MemoryLayout<Float64>.size), &rate)
+        let status = Self.setNominalRate(id, Float64(sampleRate))
         if status != noErr { throw HBError.coreAudio(status) }
+    }
+
+    private static func setNominalRate(_ id: AudioDeviceID, _ rate: Float64) -> OSStatus {
+        var rate = rate
+        var address = rateAddress
+        return AudioObjectSetPropertyData(id, &address, 0, nil, UInt32(MemoryLayout<Float64>.size), &rate)
+    }
+
+    private static func nominalRate(_ id: AudioDeviceID) -> Float64? {
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        var address = rateAddress
+        return AudioObjectGetPropertyData(id, &address, 0, nil, &size, &rate) == noErr ? rate : nil
+    }
+
+    /// The rate guard's decision: nil if the rate is (or was put back to) `expected`, else the error to report.
+    static func enforceRate(expected: Float64, read: () -> Float64?, write: (Float64) -> OSStatus) -> HBError? {
+        guard let actual = read(), actual != expected else { return nil }
+        let status = write(expected)
+        if status == noErr, read() == expected { return nil }
+        return .sampleRateChanged(expected: expected, actual: actual)
+    }
+
+    /// Main queue: the device's nominal rate changed.
+    private func rateChanged() {
+        guard ioProcID != nil else { return }
+        let id = device
+        let actual = Self.nominalRate(id)
+        guard let actual, actual != sampleRate else { return }
+        log.error("sample rate changed to \(actual) Hz under the stream: setting \(self.sampleRate) Hz back")
+        guard let error = Self.enforceRate(expected: sampleRate, read: { Self.nominalRate(id) },
+                                           write: { Self.setNominalRate(id, $0) }) else { return }
+        log.error("cannot set the sample rate back: \(String(describing: error), privacy: .public)")
+        lastError = error
+        if let failureHandler { MainActor.assumeIsolated { failureHandler(error) } }
     }
 
     deinit {
@@ -48,6 +96,14 @@ public final class AudioCapture: PCMSource {
     /// `sink` is called on the HAL's real-time IO thread; the buffer is only valid during the call.
     public func start(_ sink: @escaping (UnsafeBufferPointer<Float>) -> Void) {
         guard ioProcID == nil else { return }
+        let id = device
+        // the rate may have moved since init
+        if let error = Self.enforceRate(expected: sampleRate, read: { Self.nominalRate(id) },
+                                        write: { Self.setNominalRate(id, $0) }) {
+            lastError = error
+            log.error("sample rate: \(String(describing: error), privacy: .public)")
+            return
+        }
         let box = Unmanaged.passRetained(SinkBox(sink))
         var procID: AudioDeviceIOProcID?
         var status = AudioDeviceCreateIOProcID(device, captureIOProc, box.toOpaque(), &procID)
@@ -66,6 +122,13 @@ public final class AudioCapture: PCMSource {
         ioProcID = procID
         sinkBox = box
         lastError = nil
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.rateChanged() }
+        var address = Self.rateAddress
+        if AudioObjectAddPropertyListenerBlock(device, &address, DispatchQueue.main, listener) == noErr {
+            rateListener = listener
+        } else {
+            log.error("cannot watch the sample rate")
+        }
     }
 
     private func fail(_ call: String, _ status: OSStatus) {
@@ -75,6 +138,11 @@ public final class AudioCapture: PCMSource {
 
     /// Returns once the IOProc has stopped; the sink is not called afterwards.
     public func stop() {
+        if let listener = rateListener {
+            var address = Self.rateAddress
+            AudioObjectRemovePropertyListenerBlock(device, &address, DispatchQueue.main, listener)
+            rateListener = nil
+        }
         guard let procID = ioProcID else { return }
         AudioDeviceStop(device, procID)
         AudioDeviceDestroyIOProcID(device, procID)

@@ -29,6 +29,29 @@ final class AudioCaptureTests: XCTestCase {
         XCTAssertEqual(nonZero, 0)
     }
 
+    func testRateGuardSetsTheRateBack() {
+        var rate = 44100.0
+        var writes: [Double] = []
+        let error = AudioCapture.enforceRate(expected: 48000, read: { rate },
+                                             write: { writes.append($0); rate = $0; return noErr })
+        XCTAssertNil(error)
+        XCTAssertEqual(writes, [48000])
+        XCTAssertEqual(rate, 48000)
+    }
+
+    func testRateGuardLeavesTheConfiguredRateAlone() {
+        var writes = 0
+        XCTAssertNil(AudioCapture.enforceRate(expected: 48000, read: { 48000 }, write: { _ in writes += 1; return noErr }))
+        XCTAssertEqual(writes, 0)
+    }
+
+    func testRateGuardReportsWhenTheRateWillNotGoBack() {
+        let refused = AudioCapture.enforceRate(expected: 48000, read: { 96000 }, write: { _ in -1 })
+        XCTAssertEqual(refused, .sampleRateChanged(expected: 48000, actual: 96000))
+        let ignored = AudioCapture.enforceRate(expected: 48000, read: { 96000 }, write: { _ in noErr })
+        XCTAssertEqual(ignored, .sampleRateChanged(expected: 48000, actual: 96000), "set, but did not stick")
+    }
+
     func testThrowsWhenDeviceMissing() {
         XCTAssertThrowsError(try AudioCapture(deviceName: "no-such-device-xyz", sampleRate: 48000)) { error in
             XCTAssertEqual(error as? HBError, .deviceNotInstalled)

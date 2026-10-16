@@ -37,6 +37,10 @@ final class StreamPacerTests: XCTestCase {
         XCTAssertFalse(pacer.shouldSend(framesAlreadySent: 0))
         clock = 0.2
         XCTAssertFalse(pacer.shouldSend(framesAlreadySent: 0), "nothing goes out while the preroll accumulates")
+        clock = 0.3                                   // past preroll − lead, but the preroll is not complete yet
+        XCTAssertFalse(pacer.shouldSend(framesAlreadySent: 0), "nothing goes out before the full preroll")
+        clock = 0.49
+        XCTAssertFalse(pacer.shouldSend(framesAlreadySent: 0))
         clock = 0.5                                   // clock origin: the normal 0.25 s lead is due now
         var sent = 0
         while pacer.shouldSend(framesAlreadySent: sent) { sent += 1; XCTAssertLessThan(sent, 1000) }
