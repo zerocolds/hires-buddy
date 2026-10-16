@@ -45,5 +45,7 @@ let package = Package(
             ])]
         ),
         .testTarget(name: "HiResBuddyCoreTests", dependencies: ["HiResBuddyCore", "LDACEncoder"]),
+        // The menu bar app; scripts/bundle.sh wraps it (with Resources/Info.plist) into build/HiResBuddy.app.
+        .executableTarget(name: "HiResBuddy", dependencies: ["HiResBuddyCore", "LDACEncoder"], exclude: ["Resources"]),
     ]
 )
