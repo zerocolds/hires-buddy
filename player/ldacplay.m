@@ -1,7 +1,7 @@
 // ldacplay — minimal A2DP source that streams a WAV (16/24-bit, 44.1–96 kHz) to a sink over LDAC.
 // Talks AVDTP over L2CAP channels opened directly through CoreBluetooth's classic peer: the public
 // IOBluetoothL2CAPChannel wrapper drops channels opened on an already-connected device.
-// Usage: ldacplay <wav> [seconds]
+// Usage: LDAC_ADDR=<bt-address> ldacplay <wav> [seconds]   (LDAC_Q=hq|sq|mq)
 #import <Foundation/Foundation.h>
 #import <IOBluetooth/IOBluetooth.h>
 #import <CoreBluetooth/CoreBluetooth.h>
@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include "ldacBT.h"
 
-static NSString *const kAddr = @"94-db-56-e1-43-75";
+static NSString *kAddr;         // headphone BT address, from LDAC_ADDR (e.g. 94-db-56-e1-43-75)
 static int kSF = 44100;
 static int kWL = 2;             // bytes per sample
 static uint8_t kSFBit = LDACBT_SAMPLING_FREQ_044100;
@@ -437,7 +437,9 @@ static NSString *hex(const uint8_t *b, size_t n) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc < 2) { fprintf(stderr, "usage: ldacplay <wav> [seconds]\n"); return 1; }
+        const char *addr = getenv("LDAC_ADDR");
+        if (argc < 2 || !addr) { fprintf(stderr, "usage: LDAC_ADDR=xx-xx-xx-xx-xx-xx ldacplay <wav> [seconds]\n"); return 1; }
+        kAddr = [[@(addr) lowercaseString] stringByReplacingOccurrencesOfString:@":" withString:@"-"];
         setvbuf(stdout, NULL, _IONBF, 0);
         if (!strcmp(argv[1], "--transport")) { [Player runTransportHelper:@(argv[2])]; return 0; }
         Player *p = [Player new];

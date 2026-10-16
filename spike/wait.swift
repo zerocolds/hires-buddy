@@ -1,7 +1,7 @@
 import Foundation
 import IOBluetooth
 
-let addr = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "94-DB-56-E1-43-75"
+let addr = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ProcessInfo.processInfo.environment["LDAC_ADDR"] ?? "00-00-00-00-00-00"
 guard let dev = IOBluetoothDevice(addressString: addr) else { print("no device"); exit(1) }
 print("device:", dev.name ?? "?", "connected:", dev.isConnected())
 

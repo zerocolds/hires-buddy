@@ -1,7 +1,9 @@
 #!/bin/zsh
 # play.sh <any audio file: flac/wav/aiff/m4a/mp3> [seconds]
+# env: LDAC_ADDR=<headphone bt address> (required), LDAC_Q=hq|sq|mq (default hq)
 # Decodes to stereo PCM at the file's own rate (capped at 96 kHz — the XM4 limit) and streams it over LDAC.
 set -e
+[[ -z "$LDAC_ADDR" ]] && { echo "set LDAC_ADDR=xx-xx-xx-xx-xx-xx (System Information → Bluetooth)"; exit 1; }
 in="$1"; secs="${2:-0}"
 here="${0:A:h}"
 rate=$(afinfo "$in" | awk '/Data format/{for(i=1;i<=NF;i++) if($i=="Hz,") print $(i-1)}')
