@@ -19,8 +19,17 @@ struct HiResBuddyApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let controller = SessionController()
+    private var signalSources: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // kill / Ctrl-C take the same way out as «Выход»: never leave the output stuck on HiRes Buddy.
+        signalSources = [SIGTERM, SIGINT, SIGHUP].map { sig in
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler { [controller] in MainActor.assumeIsolated { controller.quit() } }
+            source.resume()
+            return source
+        }
         Task { await controller.refreshHeadphones() }
     }
 

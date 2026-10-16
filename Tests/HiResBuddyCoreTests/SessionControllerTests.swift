@@ -94,6 +94,34 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(h.controller.phase, .off, "switching off clears the error")
     }
 
+    func testRestoreThatThrowsIsRetried() async {
+        let h = Harness()
+        await h.controller.refreshHeadphones()
+        h.controller.setEnabled(true)
+        h.recorder.sessions[0].move(to: .streaming)
+        h.link.connected = [false, true]
+        h.directory.devices.append(xm4Output)   // back already, but the HAL refuses the first switches
+        h.directory.failingSets = 3
+
+        h.controller.setEnabled(false)
+        await spin(until: { h.controller.phase == .off })
+        XCTAssertEqual(h.controller.phase, .off)
+        XCTAssertEqual(h.directory.defaultOutput, xm4Output.id, "a throwing restore does not end the retries")
+    }
+
+    func testMicrophoneAnswerFromABackgroundQueueIsDeliveredOnMain() async {
+        var answer: Bool?
+        MicrophonePermission.request(
+            status: .notDetermined,
+            ask: { reply in DispatchQueue.global().async { reply(true) } },   // like TCC's reply thread
+            completion: { granted in
+                MainActor.assertIsolated()
+                answer = granted
+            })
+        await spin(until: { answer != nil })
+        XCTAssertEqual(answer, true)
+    }
+
     func testQualityChangePropagatesWhileStreaming() async {
         let h = Harness()
         await h.controller.refreshHeadphones()
@@ -166,7 +194,7 @@ private final class Harness {
             makeCapture: { [capture] in capture },
             switcher: OutputDeviceSwitcher(directory: directory),
             isConnected: { [link] _ in link.next() },
-            requestMicrophone: { $0(true) },
+            requestMicrophone: { $0(true) },   // synchronous: the tests drive the phases step by step
             timing: .init(reconnectPoll: 0.01, restoreRetry: 0.01, closeTimeout: 0.5))
     }
 }
@@ -187,6 +215,8 @@ private final class FakeLink {
 private final class FakeDirectory: AudioDeviceDirectory {
     var devices: [AudioDeviceInfo]
     var defaultOutput: AudioDeviceID
+    /// This many setDefaultOutput calls throw before they work again.
+    var failingSets = 0
 
     init(_ devices: [AudioDeviceInfo], defaultOutput: AudioDeviceID) {
         self.devices = devices
@@ -195,7 +225,13 @@ private final class FakeDirectory: AudioDeviceDirectory {
 
     func outputDevices() -> [AudioDeviceInfo] { devices }
     func currentDefaultOutput() -> AudioDeviceID { defaultOutput }
-    func setDefaultOutput(_ id: AudioDeviceID) throws { defaultOutput = id }
+    func setDefaultOutput(_ id: AudioDeviceID) throws {
+        if failingSets > 0 {
+            failingSets -= 1
+            throw OutputDeviceError.coreAudio(-1)
+        }
+        defaultOutput = id
+    }
 }
 
 private final class FakeCapture: PCMSource {

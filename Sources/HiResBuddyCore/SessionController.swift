@@ -1,5 +1,4 @@
 import AppKit
-import AVFoundation
 import BTStream
 import Combine
 import Foundation
@@ -56,8 +55,8 @@ public final class SessionController: ObservableObject {
     /// Why the last driver install failed; nil otherwise.
     @Published public private(set) var driverInstallError: String?
 
-    /// The "HiRes Buddy" virtual device is present.
-    public var driverInstalled: Bool { switcher.deviceID(named: AudioCapture.deviceName) != nil }
+    /// The "HiRes Buddy" virtual device is present (as of the last `recheckDriver`).
+    @Published public private(set) var driverInstalled = false
 
     /// The selected headphones are connected, not known to lack LDAC, and the driver is installed.
     public var canEnable: Bool {
@@ -76,7 +75,7 @@ public final class SessionController: ObservableObject {
     private let makeCapture: @MainActor () throws -> PCMSource
     private let switcher: OutputDeviceSwitcher
     private let isConnected: @MainActor (String) -> Bool
-    private let requestMicrophone: @MainActor (@escaping @MainActor (Bool) -> Void) -> Void
+    private let requestMicrophone: @MainActor (@escaping @MainActor @Sendable (Bool) -> Void) -> Void
     private let timing: Timing
     private let log = Logger(subsystem: "HiResBuddy", category: "app")
     /// Address of the headphones being streamed to; whether the session took the link over from macOS.
@@ -99,7 +98,7 @@ public final class SessionController: ObservableObject {
          },
          switcher: OutputDeviceSwitcher = OutputDeviceSwitcher(),
          isConnected: @escaping @MainActor (String) -> Bool = { IOBluetoothDevice(addressString: $0)?.isConnected() ?? false },
-         requestMicrophone: @escaping @MainActor (@escaping @MainActor (Bool) -> Void) -> Void = SessionController.requestMicrophoneAccess,
+         requestMicrophone: @escaping @MainActor (@escaping @MainActor @Sendable (Bool) -> Void) -> Void = MicrophonePermission.request,
          timing: Timing = Timing()) {
         self.defaults = defaults
         self.listPaired = listPaired
@@ -110,6 +109,7 @@ public final class SessionController: ObservableObject {
         self.isConnected = isConnected
         self.requestMicrophone = requestMicrophone
         self.timing = timing
+        driverInstalled = switcher.deviceID(named: AudioCapture.deviceName) != nil
         quality = defaults.object(forKey: Keys.quality).flatMap { $0 as? Int }.flatMap(LDACQuality.init) ?? .sq
     }
 
@@ -272,9 +272,18 @@ public final class SessionController: ObservableObject {
         }
     }
 
+    /// Retries while only the fallback is available or the restore throws, up to `restoreTries` attempts.
     private func restoreAfterReconnect(triesLeft: Int) {
-        guard triesLeft > 0, case .fallback = restoreOutput() else { return finishReturn() }
-        after(timing.restoreRetry) { [self] in restoreAfterReconnect(triesLeft: triesLeft - 1) }
+        switch restoreOutput() {
+        case .restored?, .nothingToRestore?:
+            finishReturn()
+        case .fallback?, nil:
+            guard triesLeft > 1 else {
+                log.error("previous output not restored after \(self.timing.restoreTries) tries")
+                return finishReturn()
+            }
+            after(timing.restoreRetry) { [self] in restoreAfterReconnect(triesLeft: triesLeft - 1) }
+        }
     }
 
     private func finishReturn() {
@@ -318,6 +327,12 @@ public final class SessionController: ObservableObject {
 
     // MARK: - Driver
 
+    /// Looks for the "HiRes Buddy" device again (the panel calls this when it opens).
+    public func recheckDriver() {
+        let present = switcher.deviceID(named: AudioCapture.deviceName) != nil
+        if present != driverInstalled { driverInstalled = present }
+    }
+
     /// Installs the bundled driver (administrator password prompt), then re-checks for the device.
     public func installDriver() {
         guard !isInstallingDriver else { return }
@@ -325,24 +340,16 @@ public final class SessionController: ObservableObject {
         driverInstallError = nil
         Task {
             do { try await DriverInstaller.install() } catch { driverInstallError = "\(error)" }
-            try? await Task.sleep(for: .seconds(2))   // coreaudiod restarts and publishes the device
+            // coreaudiod restarts and publishes the device a moment later
+            for _ in 0..<10 where !driverInstalled {
+                try? await Task.sleep(for: .seconds(1))
+                recheckDriver()
+            }
             isInstallingDriver = false
         }
     }
 
     // MARK: - Helpers
-
-    /// Capturing the virtual device's input counts as microphone use; without permission the HAL delivers silence.
-    static func requestMicrophoneAccess(_ completion: @escaping @MainActor (Bool) -> Void) {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: completion(true)
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                DispatchQueue.main.async { MainActor.assumeIsolated { completion(granted) } }
-            }
-        default: completion(false)
-        }
-    }
 
     static func describe(_ err: Error?) -> String {
         guard let e = err as NSError?, e.domain == HBErrorDomain else {

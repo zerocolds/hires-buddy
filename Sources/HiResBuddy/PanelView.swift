@@ -31,7 +31,10 @@ struct PanelView: View {
         }
         .padding(14)
         .frame(width: 320)
-        .task { await controller.refreshHeadphones() }
+        .task {
+            controller.recheckDriver()
+            await controller.refreshHeadphones()
+        }
     }
 
     private var header: some View {
