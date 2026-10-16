@@ -91,7 +91,7 @@ streamer.onStats = { s in
     func sessionEnded(_ code: Int32) {
         ended = true
         printError("waiting for the headphones to reconnect to macOS…")
-        waitForReconnect(code, sawDisconnect: false, checksLeft: 120)
+        waitForReconnect(code, sawDisconnect: false, checksLeft: 320)
     }
 
     /// The restore hook drops the link first, so "reconnected" means connected after having been seen disconnected.
@@ -103,7 +103,7 @@ streamer.onStats = { s in
                 exit(code)
             }
             if checksLeft == 0 {
-                printError("headphones did not reconnect within 30 s")
+                printError("headphones did not reconnect within 80 s")
                 exit(code)
             }
             waitForReconnect(code, sawDisconnect: sawDisconnect || !connected, checksLeft: checksLeft - 1)

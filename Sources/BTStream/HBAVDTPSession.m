@@ -29,6 +29,8 @@ static const int64_t kReconnectDelay = 1500 * NSEC_PER_MSEC;
 static const NSTimeInterval kStopStepTimeout = 1.0;
 
 static const int kLinkDownChecks = 75;                        // 15 s of 200 ms checks for the ACL to drop
+static const int kReconnectPages = 3;                         // pages for system audio, including the first
+static int sReconnectPagesLeft;                               // main thread only
 
 /// Main queue: waits (up to `checksLeft` × 200 ms) for the baseband link to drop, then pages the device again
 /// kReconnectDelay later. The class object is the async target: it outlives any session.
@@ -40,6 +42,7 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
         return;
     }
     HBLOG(@"restore: link %@, reconnecting", dev.isConnected ? @"still up after 15 s" : @"down");
+    sReconnectPagesLeft = kReconnectPages - 1;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kReconnectDelay), dispatch_get_main_queue(), ^{
         [dev openConnection:HBAVDTPSession.class];
     });
@@ -129,6 +132,13 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
 // Target for the restore hook's asynchronous openConnection: (a class object outlives any session).
 + (void)connectionComplete:(IOBluetoothDevice *)dev status:(IOReturn)status {
     HBLOG(@"reconnect for system audio: status 0x%x", status);
+    // Right after a stream the XM4 sometimes refuses the first page (status 0xa after ~15 s): page again.
+    if (status != kIOReturnSuccess && sReconnectPagesLeft > 0) {
+        sReconnectPagesLeft--;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kReconnectDelay), dispatch_get_main_queue(), ^{
+            [dev openConnection:HBAVDTPSession.class];
+        });
+    }
 }
 
 #pragma mark - State

@@ -135,7 +135,8 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 @property(readonly) uint8_t negotiatedSampleRateBit;
 /// Gives A2DP back to macOS; runs at most once, before the Closed/Failed callback: on stopAndRestoreSystemAudio,
 /// and on any failure after a takeover. Default (device init): closeConnection (off the main queue), wait for the
-/// link to actually drop (up to 15 s), then openConnection 1.5 s later; nil for the test init. The reconnect is
+/// link to actually drop (up to 15 s), then openConnection 1.5 s later (paged up to 3 times while the device
+/// refuses); nil for the test init. The reconnect is
 /// asynchronous: the process must stay alive until it completes.
 @property(copy, nullable) void (^restoreHook)(void);
 /// Deadline for each sink answer during setup/suspend/resume (default 5 s) -> Failed HBErrorTimeout.
