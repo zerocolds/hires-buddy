@@ -38,9 +38,13 @@ final class WAVSource: PCMSource, @unchecked Sendable {
         while pos + 8 <= data.count {
             let id = data.ascii(pos, 4), size = data.le(pos + 4, 4)
             let start = pos + 8
-            if id == "fmt " && size >= 16 {
+            if id == "fmt " {
+                guard size >= 16, start + 16 <= data.count else { throw WAVError(description: "truncated fmt chunk") }
                 var tag = data.le(start, 2)
-                if tag == 0xFFFE && size >= 26 { tag = data.le(start + 24, 2) }   // WAVE_FORMAT_EXTENSIBLE subformat
+                if tag == 0xFFFE {                                                  // WAVE_FORMAT_EXTENSIBLE subformat
+                    guard size >= 26, start + 26 <= data.count else { throw WAVError(description: "truncated fmt chunk") }
+                    tag = data.le(start + 24, 2)
+                }
                 fmt = (tag, data.le(start + 2, 2), data.le(start + 4, 4), data.le(start + 14, 2))
             } else if id == "data" {
                 body = start..<min(start + size, data.count)
@@ -127,7 +131,8 @@ final class WAVSource: PCMSource, @unchecked Sendable {
         case .int32:
             return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: off, as: Int32.self))) / 2_147_483_648
         case .float32:
-            return Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: off, as: UInt32.self)))
+            let v = Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: off, as: UInt32.self)))
+            return v.isNaN ? 0 : min(max(v, -1), 1)
         }
     }
 }

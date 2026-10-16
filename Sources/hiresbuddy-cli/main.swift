@@ -59,9 +59,9 @@ print(String(format: "%@: %d Hz, %.1f s → %@ (%@), LDAC %@",
              wavPath, wav.sampleRate.rawValue, wav.duration, device.name ?? "?", address, "\(quality)"))
 
 streamer.onStats = { s in
-    print(String(format: "%5.0fs  %@  %d Hz  %4d kbit/s  packets %6d  buffer %.2fs  drops %d  write errors %d",
+    print(String(format: "%5.0fs  %@  %d Hz  %4d kbit/s  packets %6d  buffer %.2fs  drops %d  write errors %d  backpressure %d",
                  s.uptime, "\(s.quality)", s.sampleRate, s.bitrateKbps, s.packets, s.bufferSeconds, s.dropEvents,
-                 s.writeErrors))
+                 s.writeErrors, s.backpressureTicks))
 }
 
 /// Ctrl-C / end of file → stop, then exit once Closed arrives and the restore hook (closeConnection, then
@@ -72,6 +72,8 @@ streamer.onStats = { s in
     private let device: IOBluetoothDevice
     private var stopping = false
     private var ended = false
+    /// The session takes the link over (and must give it back) only when the device was connected at start.
+    var takeover = false
 
     init(streamer: Streamer, device: IOBluetoothDevice) {
         self.streamer = streamer
@@ -83,19 +85,22 @@ streamer.onStats = { s in
         stopping = true
         printError(reason)
         streamer.stop()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [self] in
-            if !ended { die("no Closed within 3 s, exiting", code: 0) }
+        // stop waits for SUSPEND and CLOSE answers, at most 1 s each
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in
+            if !ended { die("no Closed within 5 s, exiting", code: 0) }
         }
     }
 
-    func sessionEnded(_ code: Int32) {
+    /// Closed always runs the restore hook; Failed only after a takeover — otherwise there is little to wait for.
+    func sessionEnded(_ code: Int32, failed: Bool) {
         ended = true
+        let seconds = failed && !takeover ? 5 : 80
         printError("waiting for the headphones to reconnect to macOS…")
-        waitForReconnect(code, sawDisconnect: false, checksLeft: 320)
+        waitForReconnect(code, sawDisconnect: false, checksLeft: seconds * 4, seconds: seconds)
     }
 
     /// The restore hook drops the link first, so "reconnected" means connected after having been seen disconnected.
-    private func waitForReconnect(_ code: Int32, sawDisconnect: Bool, checksLeft: Int) {
+    private func waitForReconnect(_ code: Int32, sawDisconnect: Bool, checksLeft: Int, seconds: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [self] in
             let connected = device.isConnected()
             if sawDisconnect && connected {
@@ -103,10 +108,10 @@ streamer.onStats = { s in
                 exit(code)
             }
             if checksLeft == 0 {
-                printError("headphones did not reconnect within 80 s")
+                printError("headphones did not reconnect within \(seconds) s")
                 exit(code)
             }
-            waitForReconnect(code, sawDisconnect: sawDisconnect || !connected, checksLeft: checksLeft - 1)
+            waitForReconnect(code, sawDisconnect: sawDisconnect || !connected, checksLeft: checksLeft - 1, seconds: seconds)
         }
     }
 }
@@ -119,8 +124,8 @@ let stateNames: [HBSessionState: String] = [
 streamer.onStateChange = { state, err in
     printError("state: \(stateNames[state] ?? "\(state.rawValue)")" + (err.map { " — \($0.localizedDescription)" } ?? ""))
     switch state {
-    case .closed: playback.sessionEnded(0)
-    case .failed: playback.sessionEnded(1)
+    case .closed: playback.sessionEnded(0, failed: false)
+    case .failed: playback.sessionEnded(1, failed: true)
     default: break
     }
 }
@@ -136,6 +141,7 @@ sigint.resume()
 
 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
     MainActor.assumeIsolated {
+        playback.takeover = device.isConnected()
         do { try streamer.start(source: wav) } catch { die("cannot start: \(error)", code: 70) }
     }
 }

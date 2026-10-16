@@ -36,8 +36,7 @@ final class StreamerTests: XCTestCase {
         XCTAssertGreaterThan(packets.count, 100)
         let seqs = packets.map { UInt16($0[2]) << 8 | UInt16($0[3]) }
         XCTAssertEqual(seqs, (0..<seqs.count).map { UInt16($0) }, "RTP sequence must have no gaps")
-        let stamps = packets.map { $0[4..<8].reduce(UInt32(0)) { $0 << 8 | UInt32($1) } }
-        XCTAssertEqual(stamps, stamps.sorted())
+        assertTimestampsFollowFrames(packets)
         XCTAssertGreaterThanOrEqual(reports.count, 2)
         guard reports.count >= 2 else { return }
         XCTAssertEqual(reports[0].quality, .mq)
@@ -70,6 +69,59 @@ final class StreamerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(reports[1].bufferSeconds, 0.2, "about lead (0.25 s) stays queued behind the sender")
     }
 
+    func testBackpressureKeepsPacketsUntilTheReaderCatchesUp() throws {
+        // a receive buffer of ~11 packets and a reader that starts late: writes fail with ENOBUFS (EAGAIN on a
+        // stream socket) for a while, and those packets must stay queued rather than be lost
+        let h = try Harness(receiveBuffer: 8192, readerDelay: 0.8)
+        let streamer = Streamer(session: h.session, sampleRate: .hz48000, quality: .hq)
+        var reports: [StreamStats] = []
+        streamer.onStats = { reports.append($0) }
+        try streamer.start(source: SineSource(rate: 48000, seconds: 3, preroll: 0.3))
+        spin(2.2)
+        streamer.stop()
+        let packets = h.reader.finish()
+
+        let seqs = packets.map { UInt16($0[2]) << 8 | UInt16($0[3]) }
+        XCTAssertGreaterThan(seqs.count, 300)
+        XCTAssertEqual(seqs, (0..<seqs.count).map { UInt16($0) }, "no packet lost to backpressure")
+        assertTimestampsFollowFrames(packets)
+        guard let last = reports.last else { return XCTFail("no stats") }
+        XCTAssertGreaterThan(last.backpressureTicks, 0)
+        XCTAssertEqual(last.writeErrors, 0)
+        XCTAssertEqual(last.dropEvents, 0)
+        XCTAssertLessThan(last.bufferSeconds, 0.7, "the queue drained back to its normal depth")
+    }
+
+    func testSuspendPausesSendingAndStreamingResumes() throws {
+        let h = try Harness()
+        let streamer = Streamer(session: h.session, sampleRate: .hz48000, quality: .hq)
+        try streamer.start(source: SineSource(rate: 48000, seconds: 4, preroll: 0.3))
+        spin(1.0)
+        h.session.move(to: .suspended)
+        spin(0.1)                                     // let a send tick that was already running finish
+        let atSuspend = h.reader.count
+        spin(0.5)
+        XCTAssertEqual(h.reader.count, atSuspend, "nothing is written while suspended")
+        h.session.move(to: .streaming)
+        spin(1.0)
+        XCTAssertGreaterThan(h.reader.count, atSuspend + 100, "sending resumes")
+        streamer.stop()
+        let seqs = h.reader.finish().map { UInt16($0[2]) << 8 | UInt16($0[3]) }
+        XCTAssertEqual(seqs, seqs.sorted())
+    }
+
+    /// Each RTP timestamp advances by the previous packet's LDAC frames × 128 samples (48 kHz).
+    private func assertTimestampsFollowFrames(_ packets: [[UInt8]], file: StaticString = #filePath, line: UInt = #line) {
+        let stamps = packets.map { $0[4..<8].reduce(UInt32(0)) { $0 << 8 | UInt32($1) } }
+        for i in packets.indices.dropFirst() {
+            let expected = stamps[i - 1] &+ UInt32(packets[i - 1][12] & 0x0f) * 128
+            if stamps[i] != expected {
+                XCTFail("packet \(i): timestamp \(stamps[i]), expected \(expected)", file: file, line: line)
+                return
+            }
+        }
+    }
+
     private func peakSeenByEncoder(gain: Float) throws -> Float {
         let h = try Harness()
         let spy = SpyEncoder()
@@ -94,13 +146,13 @@ private struct Harness {
     let session: FakeSession
     let reader: PacketReader
 
-    init() throws {
+    init(receiveBuffer: Int32 = 4 << 20, readerDelay: TimeInterval = 0) throws {
         var sv: [Int32] = [-1, -1]
         guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &sv) == 0 else { throw POSIXError(.EIO) }
-        var size: Int32 = 4 << 20
+        var size = receiveBuffer
         setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
         session = FakeSession(transportFD: sv[0])
-        reader = PacketReader(fd: sv[1])
+        reader = PacketReader(fd: sv[1], startDelay: readerDelay)
     }
 }
 
@@ -125,7 +177,7 @@ private final class FakeSession: HBAVDTPSession {
     }
 
     override var state: HBSessionState { fakeState }
-    override var transportFD: Int32 { fakeState == .streaming ? fd : -1 }
+    override var transportFD: Int32 { fakeState == .streaming || fakeState == .suspended ? fd : -1 }
 
     override func start(withSampleRateBit sfBit: UInt8) {
         startedBit = sfBit
@@ -136,7 +188,7 @@ private final class FakeSession: HBAVDTPSession {
         move(to: .closed)
     }
 
-    private func move(to state: HBSessionState) {
+    func move(to state: HBSessionState) {
         fakeState = state
         delegate?.session(self, didChange: state, error: nil)
     }
@@ -150,12 +202,17 @@ private final class PacketReader: @unchecked Sendable {
     private var stopped = false
     private let done = DispatchSemaphore(value: 0)
 
-    init(fd: Int32) {
+    init(fd: Int32, startDelay: TimeInterval = 0) {
         self.fd = fd
         var timeout = timeval(tv_sec: 0, tv_usec: 50_000)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        Thread.detachNewThread { [self] in loop() }
+        Thread.detachNewThread { [self] in
+            Thread.sleep(forTimeInterval: startDelay)
+            loop()
+        }
     }
+
+    var count: Int { lock.withLock { packets.count } }
 
     private func loop() {
         var buf = [UInt8](repeating: 0, count: 4096)
