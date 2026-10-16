@@ -29,4 +29,21 @@ final class StreamPacerTests: XCTestCase {
         XCTAssertEqual(sent, 47)
         XCTAssertEqual(pacer.dropEvents, 1)
     }
+
+    func testPacerPrerollsBeforeSending() {
+        var clock = 0.0
+        let pacer = StreamPacer(sampleRate: 48000, samplesPerFrame: 256, prerollSeconds: 0.5, now: { clock })
+        pacer.start()
+        XCTAssertFalse(pacer.shouldSend(framesAlreadySent: 0))
+        clock = 0.2
+        XCTAssertFalse(pacer.shouldSend(framesAlreadySent: 0), "nothing goes out while the preroll accumulates")
+        clock = 0.5                                   // clock origin: the normal 0.25 s lead is due now
+        var sent = 0
+        while pacer.shouldSend(framesAlreadySent: sent) { sent += 1; XCTAssertLessThan(sent, 1000) }
+        XCTAssertEqual(sent, 47)
+        clock = 0.6                                   // then real time: 18.75 frames per 0.1 s
+        while pacer.shouldSend(framesAlreadySent: sent) { sent += 1 }
+        XCTAssertEqual(sent, 66)
+        XCTAssertEqual(pacer.dropEvents, 0)
+    }
 }

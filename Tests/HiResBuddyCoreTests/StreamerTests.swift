@@ -12,7 +12,7 @@ final class StreamerTests: XCTestCase {
         var states: [HBSessionState] = []
         streamer.onStateChange = { state, _ in states.append(state) }
         try streamer.start(source: SineSource(rate: 48000, seconds: 1, preroll: 1))
-        spin(1.2)
+        spin(1.5)
         streamer.stop()
         let packets = h.reader.finish()
         XCTAssertGreaterThanOrEqual(packets.count, 150)
@@ -26,10 +26,10 @@ final class StreamerTests: XCTestCase {
         let streamer = Streamer(session: h.session, sampleRate: .hz48000, quality: .hq)
         var reports: [StreamStats] = []
         streamer.onStats = { reports.append($0) }
-        try streamer.start(source: SineSource(rate: 48000, seconds: 3, preroll: 0.3))
+        try streamer.start(source: SineSource(rate: 48000, seconds: 4, preroll: 0.3))
         spin(0.5)
         streamer.quality = .mq
-        spin(1.7)
+        spin(2.7)
         streamer.stop()
         let packets = h.reader.finish()
 
@@ -41,8 +41,8 @@ final class StreamerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(reports.count, 2)
         guard reports.count >= 2 else { return }
         XCTAssertEqual(reports[0].quality, .mq)
-        XCTAssertLessThan(reports[1].bitrateKbps, 400)
-        XCTAssertLessThan(reports[1].bitrateKbps, reports[0].bitrateKbps)
+        XCTAssertLessThan(reports.last!.bitrateKbps, 400)       // window 2–3 s: all mq
+        XCTAssertLessThan(reports.last!.bitrateKbps, reports[0].bitrateKbps)
         XCTAssertEqual(streamer.stats.quality, .mq)
     }
 
@@ -67,6 +67,7 @@ final class StreamerTests: XCTestCase {
         XCTAssertEqual(reports[1].quality, .hq)
         XCTAssertGreaterThan(reports[1].packets, 300)
         XCTAssertEqual(reports[1].dropEvents, 0)
+        XCTAssertGreaterThanOrEqual(reports[1].bufferSeconds, 0.2, "about lead (0.25 s) stays queued behind the sender")
     }
 
     private func peakSeenByEncoder(gain: Float) throws -> Float {

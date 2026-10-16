@@ -61,6 +61,7 @@ public final class Streamer {
     private var delegateProxy: SessionDelegateProxy?
     private var source: PCMSource?
     private var engine: StreamEngine?
+    private var activity: NSObjectProtocol?
 
     public convenience init(session: HBAVDTPSession, sampleRate: LDACSampleRate, quality: LDACQuality) {
         self.init(session: session, sampleRate: sampleRate, quality: quality,
@@ -87,6 +88,9 @@ public final class Streamer {
         }
         self.engine = engine
         self.source = source
+        // keeps App Nap from coalescing the 4 ms send timer while streaming in the background
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
+                                                         reason: "LDAC streaming")
         let proxy = SessionDelegateProxy { [weak self] state, err in self?.sessionChanged(state, err) }
         delegateProxy = proxy
         session.delegate = proxy
@@ -121,6 +125,8 @@ public final class Streamer {
         source?.stop()
         source = nil
         if let engine { engine.queue.sync { engine.stop() } }
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        activity = nil
     }
 
     private func publish(_ s: StreamStats) {
@@ -151,6 +157,7 @@ private final class StreamEngine: @unchecked Sendable {
 
     private static let blockSamples = LDACEncoder.framesPerBlock * 2
     private static let rtpHeaderBytes = 13   // RTP header + LDAC media payload header
+    private static let leadSeconds = 0.25
 
     private let log = Logger(subsystem: "HiResBuddy", category: "stream")
     private let encoder: any PacketEncoder
@@ -178,7 +185,10 @@ private final class StreamEngine: @unchecked Sendable {
     init(encoder: any PacketEncoder, sampleRate: Int) {
         self.encoder = encoder
         self.sampleRate = sampleRate
+        // Transmission starts 2×lead after the first packet: lead goes out at once (the sink's cushion), and lead
+        // stays queued here so that source/scheduling jitter below that is absorbed instead of reaching the sink.
         pacer = StreamPacer(sampleRate: sampleRate, samplesPerFrame: encoder.samplesPerFrame,
+                            leadSeconds: Self.leadSeconds, prerollSeconds: 2 * Self.leadSeconds,
                             now: { ProcessInfo.processInfo.systemUptime })
         scratch = [Float](repeating: 0, count: Self.blockSamples)
     }
