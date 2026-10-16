@@ -1,3 +1,4 @@
+// hiresbuddy-cli probe — paired A2DP devices and their LDAC support.
 // hiresbuddy-cli play <wav> [--addr xx-xx-xx-xx-xx-xx] [--quality hq|sq|mq] — LDAC playback of a WAV file.
 import BTStream
 import Foundation
@@ -16,9 +17,31 @@ func die(_ message: String, code: Int32 = 64) -> Never {
     exit(code)
 }
 
-let usage = "usage: hiresbuddy-cli play <wav> [--addr xx-xx-xx-xx-xx-xx] [--quality hq|sq|mq]  (--addr defaults to $LDAC_ADDR)"
+let usage = "usage: hiresbuddy-cli probe | hiresbuddy-cli play <wav> [--addr xx-xx-xx-xx-xx-xx] [--quality hq|sq|mq]  (--addr defaults to $LDAC_ADDR)"
 
 var args = Array(CommandLine.arguments.dropFirst())
+
+if args == ["probe"] {
+    func rateList(_ mask: UInt8) -> String {
+        let rates: [(UInt8, String)] = [(0x20, "44.1"), (0x10, "48"), (0x08, "88.2"), (0x04, "96")]
+        return rates.filter { mask & $0.0 != 0 }.map(\.1).joined(separator: "/")
+    }
+    Task { @MainActor in
+        for var h in HeadphoneDiscovery.pairedA2DPDevices() {
+            if h.isConnected { h = await HeadphoneDiscovery.probeLDAC(h) }   // one at a time
+            let ldac: String
+            switch h.ldacSampleRates {
+            case nil: ldac = "unknown"
+            case 0?: ldac = "no LDAC"
+            case let mask?: ldac = "LDAC " + rateList(mask)
+            }
+            print("\(h.name)  \(h.id)  \(h.isConnected ? "connected" : "disconnected")  \(ldac)")
+        }
+        exit(0)
+    }
+    RunLoop.main.run()
+}
+
 guard args.first == "play", args.count >= 2 else { die(usage) }
 args.removeFirst()
 var wavPath: String?
