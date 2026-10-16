@@ -55,6 +55,10 @@ typedef NS_ENUM(uint8_t, HBAVDTPSignal) {
 /// Only one open may be pending per device at a time: the peer has a single connect callback, and a second
 /// call overwrites the first one's completion. The channel keeps the peer alive until `close`.
 + (void)openPSM:(uint16_t)psm onDevice:(IOBluetoothDevice *)dev completion:(void (^)(HBL2CAPChannel * _Nullable ch, NSInteger code))completion;
+/// Whether the private pieces `openPSM:` relies on exist on this macOS: -[IOBluetoothDevice classicPeer], the peer's
+/// setConnectL2CAPCallback: and openL2CAPChannel: (checked on `dev`'s peer when it has one, else on CBClassicPeer),
+/// and CBL2CAPChannel's _socketFD/_outgoingMTU ivars. Runtime introspection only: no Bluetooth traffic.
++ (BOOL)privateAPIAvailableForDevice:(nullable IOBluetoothDevice *)dev;
 /// Wraps a ready socket (fd handed over by the helper process). `close` closes the fd. nil if streams cannot be created.
 - (nullable instancetype)initWithSocketFD:(int)fd name:(NSString *)name;
 - (instancetype)init NS_UNAVAILABLE;
@@ -80,6 +84,8 @@ typedef NS_ENUM(uint8_t, HBAVDTPSignal) {
 /// Completion on the main queue: fd >= 0 and code 0 on success; fd -1 and the helper's code on failure
 /// (-1 when the helper died, timed out after 15 s, was terminated, or could not be started).
 - (void)openTransportForAddress:(NSString *)addr psm:(uint16_t)psm completion:(void (^)(int fd, NSInteger code))completion;
+/// The unix socket the helper connects to: in NSTemporaryDirectory() (per-user, 0700), mode 0600. nil when none.
+@property(readonly, copy, nullable) NSString *socketPath;
 /// Kills the helper (closing its channel) and removes the socket path. Safe to call repeatedly.
 - (void)terminate;
 @end
@@ -93,6 +99,7 @@ typedef NS_ERROR_ENUM(HBErrorDomain, HBSessionError) {
     HBErrorChannelOpenFailed = 4,   // signaling channel could not be opened (after retries)
     HBErrorTransportFailed = 5,     // helper could not hand over the transport channel
     HBErrorTimeout = 6,             // sink did not answer a command within transactionTimeout
+    HBErrorPrivateAPIUnavailable = 7, // the private CoreBluetooth/IOBluetooth pieces are missing on this macOS
 };
 
 typedef NS_ENUM(NSInteger, HBSessionState) {
@@ -134,11 +141,19 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 /// The LDAC sample-rate bit accepted by the sink; 0 before SET_CONFIGURATION is accepted.
 @property(readonly) uint8_t negotiatedSampleRateBit;
 /// Gives A2DP back to macOS; runs at most once, before the Closed/Failed callback: on stopAndRestoreSystemAudio,
-/// and on any failure after a takeover. Default (device init): closeConnection (off the main queue), wait for the
+/// and on any failure after a takeover — except when the headphones left on their own (linkProbe says the link is
+/// down) on a Failed HBErrorSinkDisconnected, or on a stop after the stream had been configured: then there is
+/// nothing to give back, and the link must not be dropped or paged. Default (device init): closeConnection (off the main queue), wait for the
 /// link to actually drop (up to 15 s), then openConnection 1.5 s later (paged up to 3 times while the device
 /// refuses); nil for the test init. The reconnect is
 /// asynchronous: the process must stay alive until it completes.
 @property(copy, nullable) void (^restoreHook)(void);
+/// Checked first by startWithSampleRateBit:, before any takeover; NO -> Failed HBErrorPrivateAPIUnavailable.
+/// Default (device init): +[HBL2CAPChannel privateAPIAvailableForDevice:]; nil (test inits): skipped.
+@property(copy, nullable) BOOL (^privateAPIPreflight)(void);
+/// Whether the baseband link to the headphones is up. Default (device init): the device's isConnected; nil (test
+/// inits): treated as up.
+@property(copy, nullable) BOOL (^linkProbe)(void);
 /// Deadline for each sink answer during setup/suspend/resume (default 5 s) -> Failed HBErrorTimeout.
 @property NSTimeInterval transactionTimeout;
 /// Deadline for one signaling-channel open (default 3 s); no callback by then counts as a failed attempt.
@@ -155,7 +170,7 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 @property NSInteger maxNegotiationRetries;
 /// Called on the main queue with every session log line (also sent to os_log, subsystem HiResBuddy).
 @property(copy, nullable) void (^logHandler)(NSString *message);
-/// Full path to Streaming: if the device is connected, takeover (closeConnection, first attempt 1 s later). Then
+/// Full path to Streaming: privateAPIPreflight, then if the device is connected, takeover (closeConnection, first attempt 1 s later). Then
 /// signaling-open attempts (up to maxOpenAttempts, openRetryInterval apart): when the baseband link is down,
 /// openConnection and wait for it (connectionComplete or isConnected, at most 10 s); then open PSM 0x19 with a
 /// signalingOpenTimeout deadline (a channel arriving after its deadline is closed). Then DISCOVER,

@@ -1,6 +1,7 @@
 #import "BTStream.h"
 #import "HBPrivateAPI.h"
 #include <errno.h>
+#include <objc/runtime.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -29,10 +30,27 @@
         keepPeer = nil;
         dispatch_async(dispatch_get_main_queue(), ^{
             HBL2CAPChannel *c = ch ? [[HBL2CAPChannel alloc] initWithCBChannel:ch peer:owner psm:psm] : nil;
-            completion(c, code);
+            completion(c, c || !ch ? code : -2);   // -2: a channel arrived but its socket could not be read
         });
     }];
     [peer openL2CAPChannel:psm];
+}
+
++ (BOOL)privateAPIAvailableForDevice:(IOBluetoothDevice *)dev {
+    if (![IOBluetoothDevice instancesRespondToSelector:@selector(classicPeer)]) return NO;
+    SEL setCallback = @selector(setConnectL2CAPCallback:), open = @selector(openL2CAPChannel:);
+    id peer = nil;
+    if (dev) {
+        @try { peer = [dev classicPeer]; } @catch (NSException *e) { return NO; }
+    }
+    if (peer) {
+        if (![peer respondsToSelector:setCallback] || ![peer respondsToSelector:open]) return NO;
+    } else {
+        Class cls = NSClassFromString(@"CBClassicPeer");
+        if (!cls || ![cls instancesRespondToSelector:setCallback] || ![cls instancesRespondToSelector:open]) return NO;
+    }
+    Class ch = CBL2CAPChannel.class;
+    return class_getInstanceVariable(ch, "_socketFD") != NULL && class_getInstanceVariable(ch, "_outgoingMTU") != NULL;
 }
 
 static void HBDisableSigPipe(int fd) {
@@ -45,8 +63,18 @@ static void HBDisableSigPipe(int fd) {
     _cbChannel = ch;
     _peer = peer;
     _name = [NSString stringWithFormat:@"psm 0x%02x", psm];
-    _socketFD = [[ch valueForKey:@"socketFD"] intValue];
-    _outgoingMTU = [[ch valueForKey:@"outgoingMTU"] unsignedShortValue];
+    // Private ivars (checked by privateAPIAvailableForDevice:); KVC raises if they are gone: fail the open instead.
+    @try {
+        _socketFD = [[ch valueForKey:@"socketFD"] intValue];
+        _outgoingMTU = [[ch valueForKey:@"outgoingMTU"] unsignedShortValue];
+    } @catch (NSException *e) {
+        NSLog(@"[%@] cannot read the channel's socket (%@): private API changed", _name, e.reason);
+        _closed = YES;
+        _socketFD = -1;
+        _cbChannel = nil;
+        _peer = nil;
+        return nil;
+    }
     HBDisableSigPipe(_socketFD);
     [self attachInput:ch.inputStream output:ch.outputStream];
     return self;

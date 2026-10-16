@@ -32,6 +32,15 @@ static const int kLinkDownChecks = 75;                        // 15 s of 200 ms 
 static const int kReconnectPages = 3;                         // pages for system audio, including the first
 static int sReconnectPagesLeft;                               // main thread only
 
+/// Sessions waiting for their own page, by device address (weak values): openConnection: targets the class object
+/// (it outlives any session), and +connectionComplete:status: forwards to the session if it is still around.
+static NSMapTable<NSString *, HBAVDTPSession *> *HBPagingSessions(void) {
+    static NSMapTable *table;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ table = [NSMapTable strongToWeakObjectsMapTable]; });
+    return table;
+}
+
 /// Main queue: waits (up to `checksLeft` × 200 ms) for the baseband link to drop, then pages the device again
 /// kReconnectDelay later. The class object is the async target: it outlives any session.
 static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
@@ -82,6 +91,9 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     _maxOpenAttempts = 10;
     _negotiationRetryInterval = 2.0;
     _maxNegotiationRetries = 3;
+    _privateAPIPreflight = ^BOOL { return [HBL2CAPChannel privateAPIAvailableForDevice:dev]; };
+    __weak IOBluetoothDevice *weakDev = dev;
+    _linkProbe = ^BOOL { return weakDev.isConnected; };
     NSString *addr = dev.addressString;
     _transportProvider = ^(void (^done)(int)) {
         [helper openTransportForAddress:addr psm:kAVDTPPSM completion:^(int fd, NSInteger code) {
@@ -134,8 +146,15 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     [_helper terminate];
 }
 
-// Target for the restore hook's asynchronous openConnection: (a class object outlives any session).
+// Target for every asynchronous openConnection: (a class object outlives any session): a session's own page while
+// it is still around and waiting for it, else the restore hook's reconnect.
 + (void)connectionComplete:(IOBluetoothDevice *)dev status:(IOReturn)status {
+    NSString *addr = dev.addressString;
+    HBAVDTPSession *waiting = addr ? [HBPagingSessions() objectForKey:addr] : nil;
+    if (waiting && waiting->_pagingToken) {
+        [waiting basebandConnected:dev status:status];
+        return;
+    }
     HBLOG(@"reconnect for system audio: status 0x%x", status);
     // Right after a stream the XM4 sometimes refuses the first page (status 0xa after ~15 s): page again.
     if (status != kIOReturnSuccess && sReconnectPagesLeft > 0) {
@@ -172,7 +191,17 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     [_sig close];
     _sig = nil;
     [_helper terminate];
+    [self endPaging];
 }
+
+/// The attempt no longer waits for its page: later completions go to the restore logic.
+- (void)endPaging {
+    _pagingToken = 0;
+    NSString *addr = _dev.addressString;
+    if (addr && [HBPagingSessions() objectForKey:addr] == self) [HBPagingSessions() removeObjectForKey:addr];
+}
+
+- (BOOL)linkIsUp { return self.linkProbe ? self.linkProbe() : YES; }
 
 - (void)runRestoreHookOnce {
     if (_restored) return;
@@ -196,9 +225,15 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
 - (void)failWithCode:(HBSessionError)code message:(NSString *)msg {
     if (self.isFinished) return;
     SLOG(@"failed: %@", msg);
+    BOOL restore = _tookOver;
+    if (restore && code == HBErrorSinkDisconnected && !self.linkIsUp) {
+        // The headphones left on their own: dropping or paging the link would only drag them back.
+        SLOG(@"link already down: not restoring");
+        restore = NO;
+    }
     [self finishWithState:HBSessionFailed
                     error:[NSError errorWithDomain:HBErrorDomain code:code userInfo:@{ NSLocalizedDescriptionKey: msg }]
-                  restore:_tookOver];
+                  restore:restore];
 }
 
 - (BOOL)isFinished { return _state == HBSessionClosed || _state == HBSessionFailed; }
@@ -251,6 +286,12 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     NSUInteger epoch = _epoch;
     [self setState:HBSessionConnecting error:nil];
     if (_epoch != epoch) return;                                // the delegate stopped us
+    // Before anything touches the link: without these pieces a takeover could not be undone by a stream.
+    if (self.privateAPIPreflight && !self.privateAPIPreflight()) {
+        [self failWithCode:HBErrorPrivateAPIUnavailable
+                   message:@"private Bluetooth API (CBClassicPeer / CBL2CAPChannel) unavailable on this macOS"];
+        return;
+    }
     if (_sig) { [self sendOrFail:HBAVDTPDiscover payload:nil]; return; }
     if (!_dev.isConnected) { [self openSignalingAttempt]; return; }
     // The sink holds one AVDTP session and macOS owns it: drop the baseband link and ask for the channel early,
@@ -283,7 +324,9 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     if (_dev && !_dev.isConnected) {
         SLOG(@"signaling attempt %d/%ld: device not connected, paging", _openAttempts, (long)self.maxOpenAttempts);
         _pagingToken = token;
-        IOReturn rc = [_dev openConnection:self];
+        NSString *addr = _dev.addressString;
+        if (addr) [HBPagingSessions() setObject:self forKey:addr];
+        IOReturn rc = [_dev openConnection:HBAVDTPSession.class];
         if (rc != kIOReturnSuccess) SLOG(@"openConnection returned 0x%x", rc);
         [self pollConnectedForAttempt:token deadline:[NSDate dateWithTimeIntervalSinceNow:kConnectTimeout]];
         return;
@@ -296,10 +339,10 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     [self after:[self nanoseconds:kConnectPollInterval] do:^(HBAVDTPSession *me) {
         if (me->_pagingToken != token || me->_attemptToken != token) return;   // connectionComplete got there first
         if (me->_dev.isConnected) {
-            me->_pagingToken = 0;
+            [me endPaging];
             [me openPSMForAttempt:token];
         } else if (deadline.timeIntervalSinceNow <= 0) {
-            me->_pagingToken = 0;
+            [me endPaging];
             [me attemptFailed:token reason:@"paging timed out"];
         } else {
             [me pollConnectedForAttempt:token deadline:deadline];
@@ -307,12 +350,12 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     }];
 }
 
-/// IOBluetooth's openConnection: target. Main thread.
-- (void)connectionComplete:(IOBluetoothDevice *)dev status:(IOReturn)status {
+/// Forwarded by +connectionComplete:status: (the openConnection: target). Main thread.
+- (void)basebandConnected:(IOBluetoothDevice *)dev status:(IOReturn)status {
     SLOG(@"baseband connect: status 0x%x", status);
     NSUInteger token = _pagingToken;
+    [self endPaging];
     if (!token || token != _attemptToken || _stopping || self.isFinished) return;
-    _pagingToken = 0;
     if (status == kIOReturnSuccess) [self openPSMForAttempt:token];
     else [self attemptFailed:token reason:[NSString stringWithFormat:@"paging failed (0x%x)", status]];
 }
@@ -553,7 +596,13 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
 }
 
 - (void)finishStop {
-    [self finishWithState:HBSessionClosed error:nil restore:YES];
+    BOOL restore = YES;
+    if (_negotiatedSampleRateBit != 0 && !self.linkIsUp) {
+        // The stream had been configured (our channels held the link), so a down link means the headphones left.
+        SLOG(@"link already down at stop: not restoring");
+        restore = NO;
+    }
+    [self finishWithState:HBSessionClosed error:nil restore:restore];
 }
 
 @end

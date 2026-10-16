@@ -68,8 +68,14 @@
         [e fulfill];
     }];
     [self waitForExpectationsWithTimeout:5 handler:nil];
-    NSString *path = [NSString stringWithFormat:@"/tmp/hiresbuddy-%d.sock", getpid()];
+    NSString *path = _client.socketPath;
+    XCTAssertNotNil(path);
+    XCTAssertTrue([path hasPrefix:NSTemporaryDirectory()], @"per-user temporary directory, not /tmp: %@", path);
+    struct stat st;
+    XCTAssertEqual(stat(path.fileSystemRepresentation, &st), 0);
+    XCTAssertEqual(st.st_mode & 0777, 0600);
     [_client terminate];
+    XCTAssertNil(_client.socketPath);
     XCTAssertNotEqual(access(path.fileSystemRepresentation, F_OK), 0);
 }
 @end

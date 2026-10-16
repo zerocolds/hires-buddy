@@ -2,6 +2,7 @@
 #include <poll.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -31,14 +32,22 @@ static const int kAcceptTimeoutMs = 15000;
 - (void)openTransportForAddress:(NSString *)addr psm:(uint16_t)psm completion:(void (^)(int, NSInteger))completion {
     [self terminate];
     atomic_store(&_cancelled, NO);
-    NSString *path = [NSString stringWithFormat:@"/tmp/hiresbuddy-%d.sock", getpid()];
+    // The per-user temporary directory (0700) rather than the world-writable /tmp; the socket itself 0600.
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                                 [NSString stringWithFormat:@"hiresbuddy-%d.sock", getpid()]];
     unlink(path.fileSystemRepresentation);
-    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un a = { .sun_family = AF_UNIX };
-    strlcpy(a.sun_path, path.fileSystemRepresentation, sizeof a.sun_path);
-    if (lfd < 0 || bind(lfd, (struct sockaddr *)&a, sizeof a) || listen(lfd, 1)) {
+    if (strlcpy(a.sun_path, path.fileSystemRepresentation, sizeof a.sun_path) >= sizeof a.sun_path) {
+        NSLog(@"transport helper: socket path too long: %@", path);
+        [self finish:completion fd:-1 code:-1];
+        return;
+    }
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lfd < 0 || bind(lfd, (struct sockaddr *)&a, sizeof a) || chmod(path.fileSystemRepresentation, 0600) ||
+        listen(lfd, 1)) {
         NSLog(@"transport helper: bind %@ failed: %s", path, strerror(errno));
         if (lfd >= 0) close(lfd);
+        unlink(path.fileSystemRepresentation);
         [self finish:completion fd:-1 code:-1];
         return;
     }
@@ -106,6 +115,8 @@ static const int kAcceptTimeoutMs = 15000;
         [self finish:completion fd:fd code:code];
     });
 }
+
+- (NSString *)socketPath { return _sockPath; }
 
 - (void)terminate {
     atomic_store(&_cancelled, YES);

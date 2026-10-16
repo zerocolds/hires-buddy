@@ -418,6 +418,62 @@ static void Answer(HBFakeSignalingChannel *ch, uint8_t type, NSString *rest) {
     for (NSNumber *fd in peers) close(fd.intValue);
 }
 
+#pragma mark - Private API preflight, link loss
+
+- (void)testPrivateAPIPreflightFailureFailsBeforeAnyTakeover {
+    __block int restored = 0;
+    __block int preflights = 0;
+    _session.restoreHook = ^{ restored++; };
+    _session.privateAPIPreflight = ^BOOL { preflights++; return NO; };
+    [_session startWithSampleRateBit:0x10];
+    XCTAssertEqual(preflights, 1);
+    XCTAssertEqual(_session.state, HBSessionFailed);
+    XCTAssertEqualObjects(_recorder.lastError.domain, HBErrorDomain);
+    XCTAssertEqual(_recorder.lastError.code, HBErrorPrivateAPIUnavailable);
+    XCTAssertEqual(_fake.sent.count, 0u, @"nothing is sent");
+    XCTAssertEqual(restored, 0, @"no takeover happened: nothing to restore");
+}
+
+- (void)testPrivateAPIPreflightOnThisMac {
+    // The selectors and CBL2CAPChannel ivars the device path relies on exist on the macOS running the tests.
+    XCTAssertTrue([HBL2CAPChannel privateAPIAvailableForDevice:nil]);
+}
+
+- (void)testSinkDisconnectWithLinkDownDoesNotRestore {
+    [self driveToStreaming];
+    __block int restored = 0;
+    _session.restoreHook = ^{ restored++; };
+    [_session setValue:@YES forKey:@"tookOver"];                       // as after a real takeover
+    _session.linkProbe = ^BOOL { return NO; };                        // the headphones went away
+    [_fake simulateClose];
+    XCTAssertEqual(_session.state, HBSessionFailed);
+    XCTAssertEqual(_recorder.lastError.code, HBErrorSinkDisconnected);
+    XCTAssertEqual(restored, 0, @"no closeConnection, no paging: the headphones left on their own");
+}
+
+- (void)testSinkDisconnectWithLinkUpStillRestoresAfterTakeover {
+    [self driveToStreaming];
+    __block int restored = 0;
+    _session.restoreHook = ^{ restored++; };
+    [_session setValue:@YES forKey:@"tookOver"];
+    _session.linkProbe = ^BOOL { return YES; };                       // e.g. the sink sent CLOSE, link still up
+    [_fake reply:HEX(@"00 08 0c")];
+    XCTAssertEqual(_session.state, HBSessionFailed);
+    XCTAssertEqual(restored, 1);
+}
+
+- (void)testStopWithLinkDownDoesNotRestore {
+    [self driveToStreaming];
+    __block int restored = 0;
+    _session.restoreHook = ^{ restored++; };
+    _session.linkProbe = ^BOOL { return NO; };
+    [_session stopAndRestoreSystemAudio];
+    [_fake reply:HEX(@"82 09")];
+    [_fake reply:HEX(@"92 08")];
+    XCTAssertEqual(_session.state, HBSessionClosed);
+    XCTAssertEqual(restored, 0, @"the stream was up and the link is gone: nothing to give back");
+}
+
 - (void)testSetupRejectWithoutWayToReopenFails {
     [_session startWithSampleRateBit:0x10];
     [self replyDiscoverAndCaps:YES];
