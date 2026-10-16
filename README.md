@@ -35,10 +35,30 @@ Using it: pair and connect the headphones in macOS, open the panel, pick them, f
 headphones disconnect and reconnect once (the takeover), then the default output is "HiRes Buddy"
 and any app plays through LDAC; the Mac's volume keys keep working.
 
-Known behaviour: about 10–20 s into a stream there may be one short glitch — `bluetoothd` retries its
-own A2DP connection and the headphones reject it. If the sink rejects the setup, the session
-renegotiates by itself. After switching off, the headphones take a few seconds to come back to macOS;
-the panel shows "Возвращаю наушники системе…" meanwhile, and Quit waits for it.
+If the sink rejects the setup, the session renegotiates by itself. After switching off, the headphones
+take a few seconds to come back to macOS; the panel shows "Возвращаю наушники системе…" meanwhile, and
+Quit waits for it (pressing «Выход» again quits at once). If the headphones go away by themselves
+(switched off, out of range), the panel says «Наушники отключились», the output goes back at once and
+nothing tries to page them.
+
+## Known issues
+
+- **About 0.5 s of added latency.** The streamer pre-rolls 0.5 s of audio before the first packet
+  (0.25 s is sent at once as the headphones' cushion, 0.25 s stays queued to absorb jitter). Fine for
+  music, noticeable for video and games.
+- **Any SCO on the headphones kills the stream.** A call, Siri, or any app opening the headphones'
+  microphone switches them to the hands-free profile; A2DP (and with it the LDAC stream) ends.
+- **Radio stutter at 990 kbps.** HQ needs a clean 2.4 GHz channel and short range; with Wi-Fi traffic or
+  a body in the way, 660 kbps (the default) is the stable choice.
+- **One glitch 10–20 s into a stream.** `bluetoothd` retries its own A2DP connection and the headphones
+  reject it; there may be one short dropout when that happens.
+- **Microphone permission is asked again after each rebuild.** The bundle is ad-hoc signed, so TCC sees
+  a new code hash (cdhash) every build; grant it again (or reset with `tccutil reset Microphone`).
+- **No driver uninstall in the app.** Use `sudo driver/uninstall.sh`.
+- **Recovery after a crash.** If the app dies mid-stream, the default output stays "HiRes Buddy"
+  (silence) and the headphones stay away from macOS. Relaunch the app: it puts the previous output back
+  (it is remembered in the app's defaults). If A2DP does not come back to the headphones, power-cycle
+  them (or disconnect/reconnect them in the Bluetooth menu).
 
 `hiresbuddy-cli` (`swift run hiresbuddy-cli probe | play <wav> | system`) is the command-line
 equivalent, used for hardware testing.
