@@ -8,5 +8,7 @@
     <string>hiresbuddy-cli</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>HiRes Buddy streams LDAC audio to your Bluetooth headphones.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>HiRes Buddy reads system audio from its virtual device to send it to your headphones.</string>
 </dict>
 </plist>

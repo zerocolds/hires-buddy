@@ -1,0 +1,135 @@
+import CoreAudio
+import Foundation
+
+/// Reads what the system plays into the "HiRes Buddy" virtual device: the driver mirrors its output to its input,
+/// and an IOProc on the input side hands the interleaved stereo Float32 blocks to the sink as the HAL delivers them.
+public final class AudioCapture: PCMSource {
+    public static let deviceName = "HiRes Buddy"
+
+    private let device: AudioDeviceID
+    private var ioProcID: AudioDeviceIOProcID?
+    private var sinkBox: Unmanaged<SinkBox>?
+    private var volumeListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+
+    /// Finds the device and sets its nominal sample rate.
+    public init(deviceName: String = AudioCapture.deviceName, sampleRate: Int) throws {
+        guard let id = OutputDeviceSwitcher().deviceID(named: deviceName) else { throw HBError.deviceNotInstalled }
+        device = id
+        try Self.requireStereoFloatInput(id)
+        var rate = Float64(sampleRate)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectSetPropertyData(id, &address, 0, nil, UInt32(MemoryLayout<Float64>.size), &rate)
+        if status != noErr { throw HBError.coreAudio(status) }
+    }
+
+    deinit {
+        stop()
+        for (address, block) in volumeListeners {
+            var address = address
+            AudioObjectRemovePropertyListenerBlock(device, &address, DispatchQueue.main, block)
+        }
+    }
+
+    /// `sink` is called on the HAL's real-time IO thread; the buffer is only valid during the call.
+    public func start(_ sink: @escaping (UnsafeBufferPointer<Float>) -> Void) {
+        guard ioProcID == nil else { return }
+        let box = Unmanaged.passRetained(SinkBox(sink))
+        var procID: AudioDeviceIOProcID?
+        guard AudioDeviceCreateIOProcID(device, captureIOProc, box.toOpaque(), &procID) == noErr, let procID else {
+            box.release()
+            return
+        }
+        guard AudioDeviceStart(device, procID) == noErr else {
+            AudioDeviceDestroyIOProcID(device, procID)
+            box.release()
+            return
+        }
+        ioProcID = procID
+        sinkBox = box
+    }
+
+    /// Returns once the IOProc has stopped; the sink is not called afterwards.
+    public func stop() {
+        guard let procID = ioProcID else { return }
+        AudioDeviceStop(device, procID)
+        AudioDeviceDestroyIOProcID(device, procID)
+        ioProcID = nil
+        sinkBox?.release()
+        sinkBox = nil
+    }
+
+    /// The device's output volume (0…1, what the Mac volume keys set); 1.0 if it has no volume control.
+    public var deviceVolume: Float {
+        guard var address = volumeAddress() else { return 1 }
+        var volume: Float32 = 1
+        var size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &volume) == noErr else { return 1 }
+        return volume
+    }
+
+    /// Calls `f` with the new `deviceVolume` on the main queue whenever the volume changes.
+    public func onVolumeChange(_ f: @escaping (Float) -> Void) {
+        guard var address = volumeAddress() else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self else { return }
+            f(self.deviceVolume)
+        }
+        guard AudioObjectAddPropertyListenerBlock(device, &address, DispatchQueue.main, block) == noErr else { return }
+        volumeListeners.append((address, block))
+    }
+
+    /// Master element if the device has one, else channel 1.
+    private func volumeAddress() -> AudioObjectPropertyAddress? {
+        for element in [kAudioObjectPropertyElementMain, 1] {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: element)
+            if AudioObjectHasProperty(device, &address) { return address }
+        }
+        return nil
+    }
+
+    private static func requireStereoFloatInput(_ id: AudioDeviceID) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        var stream = AudioStreamID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioStreamID>.size)   // the first input stream is enough
+        var status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &stream)
+        guard status == noErr, size > 0 else { throw HBError.unsupportedFormat }
+        address.mSelector = kAudioStreamPropertyVirtualFormat
+        address.mScope = kAudioObjectPropertyScopeGlobal
+        var format = AudioStreamBasicDescription()
+        size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        status = AudioObjectGetPropertyData(stream, &address, 0, nil, &size, &format)
+        if status != noErr { throw HBError.coreAudio(status) }
+        let flags = format.mFormatFlags
+        guard format.mFormatID == kAudioFormatLinearPCM, format.mChannelsPerFrame == 2, format.mBitsPerChannel == 32,
+              flags & kAudioFormatFlagIsFloat != 0, flags & kAudioFormatFlagIsNonInterleaved == 0
+        else { throw HBError.unsupportedFormat }
+    }
+}
+
+private final class SinkBox {
+    let sink: (UnsafeBufferPointer<Float>) -> Void
+    init(_ sink: @escaping (UnsafeBufferPointer<Float>) -> Void) { self.sink = sink }
+}
+
+/// Real-time thread: no allocation, no locks — hand the input buffer straight to the sink.
+private func captureIOProc(_ device: AudioObjectID, _ now: UnsafePointer<AudioTimeStamp>,
+                           _ input: UnsafePointer<AudioBufferList>, _ inputTime: UnsafePointer<AudioTimeStamp>,
+                           _ output: UnsafeMutablePointer<AudioBufferList>, _ outputTime: UnsafePointer<AudioTimeStamp>,
+                           _ context: UnsafeMutableRawPointer?) -> OSStatus {
+    guard let context, input.pointee.mNumberBuffers > 0 else { return noErr }
+    let buffer = input.pointee.mBuffers   // stereo interleaved: one buffer
+    guard let data = buffer.mData else { return noErr }
+    let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+    let pcm = UnsafeBufferPointer(start: data.assumingMemoryBound(to: Float.self), count: count)
+    Unmanaged<SinkBox>.fromOpaque(context)._withUnsafeGuaranteedRef { $0.sink(pcm) }   // no retain/release
+    return noErr
+}
