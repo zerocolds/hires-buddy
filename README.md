@@ -20,7 +20,7 @@ clang -O2 -fobjc-arc -I$L/inc -I$L/src ldacplay.m $L/src/ldaclib.c $L/src/ldacBT
   -Wl,-sectcreate,__TEXT,__info_plist,../spike/Info.plist -o ldacplay
 
 # headphone address: System Information → Bluetooth
-LDAC_ADDR=94-db-56-e1-43-75 LDAC_Q=sq ./play.sh "/path/to/track.flac"
+LDAC_ADDR=00-11-22-33-44-55 LDAC_Q=sq ./play.sh "/path/to/track.flac"
 ```
 
 `LDAC_Q` is `hq` (990/909 kbps), `sq` (660/606) or `mq` (330/303). Headphones must be paired and
