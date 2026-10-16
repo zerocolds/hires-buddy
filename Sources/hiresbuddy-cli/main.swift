@@ -91,7 +91,7 @@ streamer.onStats = { s in
     func sessionEnded(_ code: Int32) {
         ended = true
         printError("waiting for the headphones to reconnect to macOS…")
-        waitForReconnect(code, sawDisconnect: false, checksLeft: 60)
+        waitForReconnect(code, sawDisconnect: false, checksLeft: 120)
     }
 
     /// The restore hook drops the link first, so "reconnected" means connected after having been seen disconnected.
@@ -103,7 +103,7 @@ streamer.onStats = { s in
                 exit(code)
             }
             if checksLeft == 0 {
-                printError("headphones did not reconnect within 15 s")
+                printError("headphones did not reconnect within 30 s")
                 exit(code)
             }
             waitForReconnect(code, sawDisconnect: sawDisconnect || !connected, checksLeft: checksLeft - 1)
@@ -139,4 +139,5 @@ DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
         do { try streamer.start(source: wav) } catch { die("cannot start: \(error)", code: 70) }
     }
 }
-dispatchMain()
+// Not dispatchMain(): that exits the main thread, and the L2CAP channels' streams are scheduled on the main run loop.
+RunLoop.main.run()
