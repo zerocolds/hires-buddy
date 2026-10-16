@@ -13,7 +13,8 @@ public final class OutputDeviceSwitcher {
 
     /// First device whose name equals `name`, nil if none.
     public func deviceID(named name: String) -> AudioDeviceID? {
-        allDevices().first { deviceName($0) == name }
+        let matches = allDevices().filter { deviceName($0) == name }
+        return matches.first { hasOutputStreams($0) } ?? matches.first
     }
 
     /// The current default output device; `kAudioObjectUnknown` if there is none.
@@ -34,9 +35,12 @@ public final class OutputDeviceSwitcher {
     /// Puts the remembered device back if it still exists; otherwise does nothing.
     public func restore() throws {
         guard let previous else { return }
-        self.previous = nil
-        guard previous != kAudioObjectUnknown, allDevices().contains(previous) else { return }
+        guard previous != kAudioObjectUnknown, allDevices().contains(previous) else {
+            self.previous = nil
+            return
+        }
         try setDefault(previous)
+        self.previous = nil
     }
 
     private static var defaultOutputAddress: AudioObjectPropertyAddress {
@@ -66,6 +70,15 @@ public final class OutputDeviceSwitcher {
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &ids) == noErr
         else { return [] }
         return ids
+    }
+
+    private func hasOutputStreams(_ id: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        return AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr && size > 0
     }
 
     private func deviceName(_ id: AudioDeviceID) -> String? {
