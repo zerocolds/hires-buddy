@@ -28,6 +28,23 @@ static const NSTimeInterval kConnectTimeout = 10.0;            // paging deadlin
 static const int64_t kReconnectDelay = 1500 * NSEC_PER_MSEC;
 static const NSTimeInterval kStopStepTimeout = 1.0;
 
+static const int kLinkDownChecks = 75;                        // 15 s of 200 ms checks for the ACL to drop
+
+/// Main queue: waits (up to `checksLeft` × 200 ms) for the baseband link to drop, then pages the device again
+/// kReconnectDelay later. The class object is the async target: it outlives any session.
+static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
+    if (dev.isConnected && checksLeft > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            HBReconnectWhenDown(dev, checksLeft - 1);
+        });
+        return;
+    }
+    HBLOG(@"restore: link %@, reconnecting", dev.isConnected ? @"still up after 15 s" : @"down");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kReconnectDelay), dispatch_get_main_queue(), ^{
+        [dev openConnection:HBAVDTPSession.class];
+    });
+}
+
 @implementation HBAVDTPSession {
     IOBluetoothDevice *_dev;                    // nil for the test init
     HBTransportHelperClient *_helper;
@@ -68,12 +85,11 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
     };
     _restoreHook = ^{
         // Dropping and re-paging the link makes bluetoothd set its own A2DP up again. closeConnection blocks,
-        // so it runs off the main queue; the asynchronous openConnection: goes back to main.
+        // so it runs off the main queue. It can return seconds before the ACL is actually gone (6.5 s seen on the
+        // XM4), and openConnection: on a link that is still up is a no-op — so page only once it is down.
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             [dev closeConnection];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kReconnectDelay), dispatch_get_main_queue(), ^{
-                [dev openConnection:HBAVDTPSession.class];
-            });
+            dispatch_async(dispatch_get_main_queue(), ^{ HBReconnectWhenDown(dev, kLinkDownChecks); });
         });
     };
     return self;
