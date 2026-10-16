@@ -236,6 +236,8 @@ wav?.onEnd = {
     DispatchQueue.main.async { MainActor.assumeIsolated { playback.stop("end of file") } }
 }
 
+// A dead socket must surface as EPIPE, never kill the process.
+signal(SIGPIPE, SIG_IGN)
 // SIGINT (Ctrl-C), SIGTERM (kill) and SIGHUP (terminal closed) all take the same stop path.
 let signalSources = [SIGINT, SIGTERM, SIGHUP].map { sig in
     signal(sig, SIG_IGN)

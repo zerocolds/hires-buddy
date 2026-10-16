@@ -7,7 +7,7 @@ struct PanelView: View {
     @ObservedObject var controller: SessionController
 
     private var isOn: Bool { controller.phase == .connecting || controller.phase == .streaming }
-    /// Stopping, or waiting for the headphones to reconnect to macOS: nothing may be touched.
+    /// Stopping, or waiting for the headphones to reconnect to macOS: nothing but «Выход» may be touched.
     private var isBusy: Bool { controller.phase == .stopping || controller.isReturningHeadphones }
 
     var body: some View {
@@ -15,8 +15,8 @@ struct PanelView: View {
             header
             Toggle("Hi-Res (LDAC)", isOn: Binding(get: { isOn }, set: { controller.setEnabled($0) }))
                 .toggleStyle(.switch)
-                .disabled(isBusy || (!isOn && !controller.canEnable))
-            if !isOn && !isBusy && !controller.canEnable { hint }
+                .disabled(isBusy || (!isOn && !controller.canEnable))   // canEnable is false while a refresh probes
+            if !isOn && !isBusy && !controller.canEnable && !controller.isRefreshing { hint }
             qualityPicker
             if let stats = controller.stats { statsBlock(stats) }
             Divider()
@@ -25,8 +25,7 @@ struct PanelView: View {
                 Button("Обновить список") { Task { await controller.refreshHeadphones() } }
                     .disabled(isBusy || isOn || controller.isRefreshing)
                 Spacer()
-                Button("Выход") { controller.quit() }
-                    .disabled(isBusy)
+                Button("Выход") { controller.quit() }   // never disabled: a second press stops any wait
             }
         }
         .padding(14)
@@ -45,6 +44,8 @@ struct PanelView: View {
     }
 
     private var status: String {
+        // The headphones went away by themselves: nothing is being returned, say what happened.
+        if controller.headphonesLeft, case .error(let message) = controller.phase { return message }
         if controller.isReturningHeadphones || controller.phase == .stopping { return "Возвращаю наушники системе…" }
         switch controller.phase {
         case .off: return controller.selected?.isConnected == true ? "Подключены · системный звук macOS" : "Не подключены"

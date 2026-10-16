@@ -12,7 +12,9 @@ import os
 /// (a new session and Streamer each time: they are single-use). Every way out — toggle off, session Failed/Closed,
 /// quit — puts the previous output back at once, waits for the headphones to reconnect to macOS (the session's
 /// restore hook drops and re-pages the link) and restores the output again, retrying while only the fallback
-/// output exists; the same sequence as `hiresbuddy-cli system`.
+/// output exists; the same sequence as `hiresbuddy-cli system`. When the headphones left on their own (the session
+/// failed with HBErrorSinkDisconnected and the link is down) nothing pages them back: the wait is short and the
+/// error stays on screen. Quitting never waits for that, and a second quit cuts any wait short.
 @MainActor
 public final class SessionController: ObservableObject {
     public enum Phase: Equatable { case off, connecting, streaming, stopping, error(String) }
@@ -24,6 +26,8 @@ public final class SessionController: ObservableObject {
         var reconnectTimeout: TimeInterval = 80
         /// After Failed without a takeover there is little to wait for.
         var failedWithoutTakeoverTimeout: TimeInterval = 5
+        /// After the headphones left on their own (link down): nothing pages them back; only a quick return counts.
+        var headphonesLeftTimeout: TimeInterval = 5
         /// The headphones' CoreAudio output appears a moment after the link is back.
         var restoreRetry: TimeInterval = 0.5
         var restoreTries = 10
@@ -50,6 +54,8 @@ public final class SessionController: ObservableObject {
     @Published public private(set) var stats: StreamStats?
     /// From the end of a stream until the headphones are back with macOS and the output is restored.
     @Published public private(set) var isReturningHeadphones = false
+    /// The stream ended because the headphones went away (link down): shown as the error, not as "returning".
+    @Published public private(set) var headphonesLeft = false
     @Published public private(set) var isRefreshing = false
     @Published public private(set) var isInstallingDriver = false
     /// Why the last driver install failed; nil otherwise.
@@ -58,10 +64,12 @@ public final class SessionController: ObservableObject {
     /// The "HiRes Buddy" virtual device is present (as of the last `recheckDriver`).
     @Published public private(set) var driverInstalled = false
 
-    /// The selected headphones are connected, not known to lack LDAC, and the driver is installed.
+    /// The selected headphones are connected, not known to lack LDAC, and the driver is installed; no refresh is
+    /// probing them (a probe holds the peer's single open callback, which a session would overwrite).
     public var canEnable: Bool {
         guard let selected else { return false }
         return selected.isConnected && selected.ldacSampleRates != 0 && driverInstalled && !isReturningHeadphones
+            && !isRefreshing
     }
 
     /// A stream exists or the headphones are still on their way back to macOS: quitting must wait.
@@ -76,6 +84,7 @@ public final class SessionController: ObservableObject {
     private let switcher: OutputDeviceSwitcher
     private let isConnected: @MainActor (String) -> Bool
     private let requestMicrophone: @MainActor (@escaping @MainActor @Sendable (Bool) -> Void) -> Void
+    private let installer: @MainActor () async throws -> Void
     private let timing: Timing
     private let log = Logger(subsystem: "HiResBuddy", category: "app")
     /// Address of the headphones being streamed to; whether the session took the link over from macOS.
@@ -96,9 +105,10 @@ public final class SessionController: ObservableObject {
          makeCapture: @escaping @MainActor () throws -> PCMSource = {
              try AudioCapture(sampleRate: LDACSampleRate.hz48000.rawValue)
          },
-         switcher: OutputDeviceSwitcher = OutputDeviceSwitcher(),
+         switcher: OutputDeviceSwitcher = OutputDeviceSwitcher(persistingIn: .standard),
          isConnected: @escaping @MainActor (String) -> Bool = { IOBluetoothDevice(addressString: $0)?.isConnected() ?? false },
          requestMicrophone: @escaping @MainActor (@escaping @MainActor @Sendable (Bool) -> Void) -> Void = MicrophonePermission.request,
+         installer: @escaping @MainActor () async throws -> Void = { try await DriverInstaller.install() },
          timing: Timing = Timing()) {
         self.defaults = defaults
         self.listPaired = listPaired
@@ -108,9 +118,28 @@ public final class SessionController: ObservableObject {
         self.switcher = switcher
         self.isConnected = isConnected
         self.requestMicrophone = requestMicrophone
+        self.installer = installer
         self.timing = timing
         driverInstalled = switcher.deviceID(named: AudioCapture.deviceName) != nil
         quality = defaults.object(forKey: Keys.quality).flatMap { $0 as? Int }.flatMap(LDACQuality.init) ?? .sq
+    }
+
+    // MARK: - Launch
+
+    /// At launch, with no stream: a crash can leave "HiRes Buddy" as the default output (nothing feeds it any more).
+    /// Puts back the output remembered by the crashed run, else the fallback output.
+    public func restoreStuckOutput() {
+        guard streamer == nil, !isReturningHeadphones else { return }
+        do {
+            switch try switcher.restoreIfStuck() {
+            case .restored(let name)?: log.info("launch: output was stuck on HiRes Buddy, restored to \(name, privacy: .public)")
+            case .fallback(let name)?: log.info("launch: output was stuck on HiRes Buddy, previous one absent, on \(name, privacy: .public)")
+            case .nothingToRestore?: log.error("launch: output stuck on HiRes Buddy and no other output exists")
+            case nil: break
+            }
+        } catch {
+            log.error("launch: cannot restore the default output: \(error)")
+        }
     }
 
     // MARK: - Headphones
@@ -214,14 +243,22 @@ public final class SessionController: ObservableObject {
     // MARK: - Quit
 
     /// Stops the stream and waits until the headphones are back with macOS and the output is restored, then calls
-    /// `terminate`. Immediately when nothing is streaming.
+    /// `terminate`. Immediately when nothing is streaming. Cuts the wait short — output restored now, terminate
+    /// at once — when the headphones left on their own (nothing is paging them), or when quit is asked again while
+    /// an earlier quit is still waiting.
     public func quit(_ terminate: @escaping @MainActor () -> Void = { NSApp.terminate(nil) }) {
         guard hasActiveSession else {
             if phase == .connecting { phase = .off }
             return terminate()
         }
+        let again = !quitCompletions.isEmpty
         quitCompletions.append(terminate)
-        if phase == .connecting || phase == .streaming { disable() }
+        if phase == .connecting || phase == .streaming { return disable() }
+        if isReturningHeadphones && (headphonesLeft || again) {
+            log.info("quit: not waiting for the headphones any longer")
+            restoreOutput()
+            finishReturn()
+        }
     }
 
     // MARK: - Session end and the way back to macOS
@@ -237,7 +274,9 @@ public final class SessionController: ObservableObject {
         case .failed:
             log.error("session failed: \(err.map { "\($0)" } ?? "?", privacy: .public)")
             if phase != .stopping { phase = .error(Self.describe(err)) }
-            sessionEnded(failed: true)
+            let left = Self.isSinkDisconnected(err) && !isConnected(address)
+            if left { log.info("the headphones left (link down): not waiting for a reconnect") }
+            sessionEnded(failed: true, headphonesLeft: left)
         default:
             break
         }
@@ -245,19 +284,25 @@ public final class SessionController: ObservableObject {
 
     /// Restores the output at once (usually onto the fallback: the headphones' output is gone during the stream),
     /// then waits for the restore hook's reconnect before restoring again.
-    private func sessionEnded(failed: Bool) {
+    /// `headphonesLeft`: the link is already down and nothing pages it: a short wait for them to come back by
+    /// themselves (already "seen disconnected").
+    private func sessionEnded(failed: Bool, headphonesLeft left: Bool = false) {
         guard streamer != nil, !isReturningHeadphones else { return }
         stats = nil
         restoreOutput()
         isReturningHeadphones = true
-        let seconds = failed && !takeover ? timing.failedWithoutTakeoverTimeout : timing.reconnectTimeout
+        headphonesLeft = left
+        let seconds = left ? timing.headphonesLeftTimeout
+            : failed && !takeover ? timing.failedWithoutTakeoverTimeout : timing.reconnectTimeout
         let checks = Int((seconds / timing.reconnectPoll).rounded())
-        waitForReconnect(sawDisconnect: false, checksLeft: checks)
+        if left && !quitCompletions.isEmpty { return finishReturn() }   // a quit is waiting: nothing to wait for
+        waitForReconnect(sawDisconnect: left, checksLeft: checks, streamer: streamer)
     }
 
     /// The restore hook drops the link first, so "reconnected" means connected after having been seen disconnected.
-    private func waitForReconnect(sawDisconnect: Bool, checksLeft: Int) {
+    private func waitForReconnect(sawDisconnect: Bool, checksLeft: Int, streamer: Streamer?) {
         after(timing.reconnectPoll) { [self] in
+            guard isReturningHeadphones, self.streamer === streamer else { return }   // cut short by quit
             let connected = isConnected(address)
             if sawDisconnect && connected {
                 log.info("headphones reconnected")
@@ -268,12 +313,13 @@ public final class SessionController: ObservableObject {
                 restoreOutput()
                 return finishReturn()
             }
-            waitForReconnect(sawDisconnect: sawDisconnect || !connected, checksLeft: checksLeft - 1)
+            waitForReconnect(sawDisconnect: sawDisconnect || !connected, checksLeft: checksLeft - 1, streamer: streamer)
         }
     }
 
     /// Retries while only the fallback is available or the restore throws, up to `restoreTries` attempts.
     private func restoreAfterReconnect(triesLeft: Int) {
+        guard isReturningHeadphones else { return }   // cut short by quit
         switch restoreOutput() {
         case .restored?, .nothingToRestore?:
             finishReturn()
@@ -290,6 +336,7 @@ public final class SessionController: ObservableObject {
         streamer = nil   // kept until now: the session's restore hook runs on in the background
         stats = nil
         isReturningHeadphones = false
+        headphonesLeft = false
         if phase == .stopping { phase = .off }
         if !quitCompletions.isEmpty {
             let completions = quitCompletions
@@ -339,7 +386,11 @@ public final class SessionController: ObservableObject {
         isInstallingDriver = true
         driverInstallError = nil
         Task {
-            do { try await DriverInstaller.install() } catch { driverInstallError = "\(error)" }
+            do { try await installer() } catch {
+                driverInstallError = "\(error)"
+                isInstallingDriver = false   // nothing was installed: nothing to wait for
+                return
+            }
             // coreaudiod restarts and publishes the device a moment later
             for _ in 0..<10 where !driverInstalled {
                 try? await Task.sleep(for: .seconds(1))
@@ -351,18 +402,39 @@ public final class SessionController: ObservableObject {
 
     // MARK: - Helpers
 
+    static func isSinkDisconnected(_ err: Error?) -> Bool {
+        guard let e = err as NSError? else { return false }
+        return e.domain == HBErrorDomain && e.code == HBSessionError.errorSinkDisconnected.rawValue
+    }
+
     static func describe(_ err: Error?) -> String {
+        if let failure = err as? StreamFailure {
+            switch failure {
+            case .captureFailed(let e): return "Не удалось захватить звук: \(e)"
+            case .sourceFailed(HBError.sampleRateChanged(let expected, let actual)):
+                return "Частота дискретизации HiRes Buddy сменилась на \(Self.khz(actual)) кГц и не вернулась "
+                    + "к \(Self.khz(expected)) кГц — поток остановлен"
+            case .sourceFailed(let e): return "Захват звука прервался: \(e)"
+            }
+        }
         guard let e = err as NSError?, e.domain == HBErrorDomain else {
             return "Поток прервался" + (err.map { ": \($0.localizedDescription)" } ?? "")
         }
+        let detail = " (код \(e.code): \(e.localizedDescription))"
         switch HBSessionError.Code(rawValue: e.code) {
         case .errorSinkRejected?: return "Наушники отклонили LDAC-поток"
         case .errorNoLDAC?: return "Наушники не поддерживают LDAC 48 кГц"
         case .errorSinkDisconnected?: return "Наушники отключились"
-        case .errorChannelOpenFailed?: return "Не удалось подключиться к наушникам"
+        case .errorChannelOpenFailed?: return "Не удалось подключиться к наушникам" + detail
         case .errorTransportFailed?: return "Не удалось открыть аудиоканал (hiresbuddy-transport)"
         case .errorTimeout?: return "Наушники не отвечают"
-        default: return "Ошибка сессии (\(e.code))"
+        case .errorPrivateAPIUnavailable?:
+            return "Эта версия macOS не поддерживает нужный HiRes Buddy Bluetooth-интерфейс" + detail
+        default: return "Ошибка сессии" + detail
         }
+    }
+
+    private static func khz(_ hz: Double) -> String {
+        hz.truncatingRemainder(dividingBy: 1000) == 0 ? String(Int(hz / 1000)) : String(format: "%.1f", hz / 1000)
     }
 }

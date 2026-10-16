@@ -77,3 +77,84 @@ final class OutputDeviceSwitcherFallbackTests: XCTestCase {
         XCTAssertEqual(dir.defaultOutput, speakers.id)
     }
 }
+
+final class OutputDeviceSwitcherManualChangeTests: XCTestCase {
+    func testRestoreLeavesAManualChoiceAlone() throws {
+        let dir = FakeDirectory([speakers, headphones, hiresBuddy, monitor], defaultOutput: headphones.id)
+        let switcher = OutputDeviceSwitcher(directory: dir)
+        try switcher.switchTo(hiresBuddy.id)
+        dir.defaultOutput = monitor.id                               // the user picked the monitor meanwhile
+        XCTAssertEqual(try switcher.restore(), .nothingToRestore)
+        XCTAssertEqual(dir.defaultOutput, monitor.id, "a manual change is not overridden")
+        XCTAssertEqual(try switcher.restore(), .nothingToRestore, "and nothing stays remembered")
+    }
+
+    func testRestoreAfterFallbackLeavesAManualChoiceAlone() throws {
+        let dir = FakeDirectory([speakers, headphones, hiresBuddy, monitor], defaultOutput: headphones.id)
+        let switcher = OutputDeviceSwitcher(directory: dir)
+        try switcher.switchTo(hiresBuddy.id)
+        dir.devices = [speakers, hiresBuddy, monitor]
+        XCTAssertEqual(try switcher.restore(), .fallback(speakers.name))
+        dir.defaultOutput = monitor.id                               // chosen by hand while on the fallback
+        dir.devices.append(headphones)
+        XCTAssertEqual(try switcher.restore(), .nothingToRestore)
+        XCTAssertEqual(dir.defaultOutput, monitor.id)
+    }
+}
+
+final class OutputDeviceSwitcherPersistenceTests: XCTestCase {
+    private var defaults: UserDefaults!
+    private var suite = ""
+
+    override func setUp() {
+        suite = "OutputDeviceSwitcherPersistenceTests.\(UUID())"
+        defaults = UserDefaults(suiteName: suite)!
+    }
+
+    override func tearDown() { defaults.removePersistentDomain(forName: suite) }
+
+    func testSwitchPersistsAndRestoreClears() throws {
+        let dir = FakeDirectory([speakers, headphones, hiresBuddy], defaultOutput: headphones.id)
+        let switcher = OutputDeviceSwitcher(directory: dir, defaults: defaults)
+        try switcher.switchTo(hiresBuddy.id)
+        XCTAssertEqual(defaults.string(forKey: OutputDeviceSwitcher.Keys.previousUID), headphones.uid)
+        XCTAssertEqual(defaults.string(forKey: OutputDeviceSwitcher.Keys.previousName), headphones.name)
+        XCTAssertEqual(try switcher.restore(), .restored(headphones.name))
+        XCTAssertNil(defaults.string(forKey: OutputDeviceSwitcher.Keys.previousUID))
+    }
+
+    func testRelaunchAfterCrashRestoresThePersistedDevice() throws {
+        let dir = FakeDirectory([speakers, headphones, hiresBuddy], defaultOutput: headphones.id)
+        try OutputDeviceSwitcher(directory: dir, defaults: defaults).switchTo(hiresBuddy.id)   // then the app dies
+
+        let relaunched = OutputDeviceSwitcher(directory: dir, defaults: defaults)
+        XCTAssertEqual(try relaunched.restoreIfStuck(), .restored(headphones.name))
+        XCTAssertEqual(dir.defaultOutput, headphones.id)
+        XCTAssertNil(defaults.string(forKey: OutputDeviceSwitcher.Keys.previousUID), "cleared once restored")
+    }
+
+    func testRelaunchWhileThePersistedDeviceIsAbsentFallsBackAndKeepsIt() throws {
+        let dir = FakeDirectory([speakers, headphones, hiresBuddy], defaultOutput: headphones.id)
+        try OutputDeviceSwitcher(directory: dir, defaults: defaults).switchTo(hiresBuddy.id)
+        dir.devices = [speakers, hiresBuddy]
+
+        let relaunched = OutputDeviceSwitcher(directory: dir, defaults: defaults)
+        XCTAssertEqual(try relaunched.restoreIfStuck(), .fallback(speakers.name))
+        XCTAssertEqual(dir.defaultOutput, speakers.id)
+        XCTAssertEqual(defaults.string(forKey: OutputDeviceSwitcher.Keys.previousUID), headphones.uid)
+    }
+
+    func testRelaunchStuckWithoutPersistedDeviceUsesTheFallback() throws {
+        let dir = FakeDirectory([speakers, hiresBuddy], defaultOutput: hiresBuddy.id)
+        XCTAssertEqual(try OutputDeviceSwitcher(directory: dir, defaults: defaults).restoreIfStuck(), .restored(speakers.name))
+        XCTAssertEqual(dir.defaultOutput, speakers.id)
+    }
+
+    func testRelaunchNotStuckLeavesTheOutputAndForgetsAStaleDevice() throws {
+        defaults.set(headphones.uid, forKey: OutputDeviceSwitcher.Keys.previousUID)
+        let dir = FakeDirectory([speakers, headphones, hiresBuddy], defaultOutput: speakers.id)
+        XCTAssertNil(try OutputDeviceSwitcher(directory: dir, defaults: defaults).restoreIfStuck())
+        XCTAssertEqual(dir.defaultOutput, speakers.id)
+        XCTAssertNil(defaults.string(forKey: OutputDeviceSwitcher.Keys.previousUID))
+    }
+}

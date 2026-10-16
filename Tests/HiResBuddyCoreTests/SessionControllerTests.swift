@@ -153,6 +153,146 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(h.directory.defaultOutput, xm4Output.id)
     }
 
+    // MARK: - Final-review fixes
+
+    func testCaptureThatFailsToStartShowsAnErrorInsteadOfStreaming() async {
+        let h = Harness()
+        await h.controller.refreshHeadphones()
+        h.capture.startError = HBError.coreAudio(-50)
+        h.link.connected = [false, true]
+        h.controller.setEnabled(true)
+        h.recorder.sessions[0].move(to: .streaming)
+        guard case .error(let message) = h.controller.phase else { return XCTFail("phase \(h.controller.phase)") }
+        XCTAssertTrue(message.hasPrefix("Не удалось захватить звук: "), message)
+        XCTAssertTrue(h.recorder.sessions[0].stopCalled, "the headphones go back to macOS")
+        XCTAssertNotEqual(h.directory.defaultOutput, hiresBuddy.id)
+        h.directory.devices.append(xm4Output)
+        await spin(until: { !h.controller.isReturningHeadphones })
+    }
+
+    func testSampleRateLostMidStreamShowsAnError() async {
+        let h = Harness()
+        await h.controller.refreshHeadphones()
+        h.controller.setEnabled(true)
+        h.recorder.sessions[0].move(to: .streaming)
+        XCTAssertEqual(h.controller.phase, .streaming)
+        h.link.connected = [false, true]
+        h.capture.fail(HBError.sampleRateChanged(expected: 48000, actual: 96000))
+        guard case .error(let message) = h.controller.phase else { return XCTFail("phase \(h.controller.phase)") }
+        XCTAssertTrue(message.contains("частота") || message.contains("Частота"), message)
+        XCTAssertTrue(h.recorder.sessions[0].stopCalled)
+        h.directory.devices.append(xm4Output)
+        await spin(until: { !h.controller.isReturningHeadphones })
+    }
+
+    func testHeadphonesThatLeftEndTheWaitQuicklyWithoutPaging() async {
+        var timing = Harness.fastTiming
+        timing.headphonesLeftTimeout = 0.3
+        timing.reconnectTimeout = 30
+        let h = Harness(timing: timing)
+        await h.controller.refreshHeadphones()
+        h.controller.setEnabled(true)
+        h.recorder.sessions[0].move(to: .streaming)
+        h.link.connected = [false]                     // the link is gone and stays gone
+
+        let failedAt = Date()
+        h.recorder.sessions[0].move(to: .failed, error: HBSessionError(.errorSinkDisconnected))
+        XCTAssertEqual(h.controller.phase, .error("Наушники отключились"))
+        XCTAssertTrue(h.controller.headphonesLeft, "the panel shows the error, not «Возвращаю…»")
+        XCTAssertFalse(h.recorder.sessions[0].stopCalled, "nothing drops or pages the link")
+        XCTAssertEqual(h.directory.defaultOutput, speakers.id, "output restored at once")
+        await spin(until: { !h.controller.isReturningHeadphones })
+        XCTAssertFalse(h.controller.isReturningHeadphones)
+        XCTAssertLessThan(Date().timeIntervalSince(failedAt), 2, "the short wait, not the 30 s one")
+        XCTAssertEqual(h.controller.phase, .error("Наушники отключились"))
+        XCTAssertFalse(h.controller.headphonesLeft)
+    }
+
+    func testQuitAfterTheHeadphonesLeftIsImmediate() async {
+        let h = Harness()                              // default 5 s short wait
+        await h.controller.refreshHeadphones()
+        h.controller.setEnabled(true)
+        h.recorder.sessions[0].move(to: .streaming)
+        h.link.connected = [false]
+        h.recorder.sessions[0].move(to: .failed, error: HBSessionError(.errorSinkDisconnected))
+        XCTAssertTrue(h.controller.isReturningHeadphones)
+
+        var terminated = false
+        h.controller.quit { terminated = true }
+        XCTAssertTrue(terminated, "no wait for headphones that left on their own")
+        XCTAssertFalse(h.controller.isReturningHeadphones)
+        XCTAssertFalse(h.recorder.sessions[0].stopCalled)
+    }
+
+    func testSecondQuitCutsTheWaitShort() async {
+        let h = Harness()
+        await h.controller.refreshHeadphones()
+        h.controller.setEnabled(true)
+        h.recorder.sessions[0].move(to: .streaming)
+        h.link.connected = [true]                      // never seen dropping: the wait would run its 80 s
+        var terminated = 0
+        h.controller.quit { terminated += 1 }
+        XCTAssertEqual(terminated, 0)
+        XCTAssertTrue(h.controller.isReturningHeadphones)
+        h.controller.quit { terminated += 1 }
+        XCTAssertEqual(terminated, 2, "both quit requests complete at once")
+        XCTAssertFalse(h.controller.isReturningHeadphones)
+        XCTAssertNotEqual(h.directory.defaultOutput, hiresBuddy.id)
+    }
+
+    func testEnableIsIgnoredWhileARefreshProbes() async {
+        let gate = ProbeGate()
+        let h = Harness(probe: { await gate.probe($0) })
+        let refresh = Task { await h.controller.refreshHeadphones() }
+        await spin(until: { gate.waiting })
+        XCTAssertTrue(h.controller.isRefreshing)
+        h.controller.selected = xm4
+        XCTAssertFalse(h.controller.canEnable, "the probe holds the peer's open callback")
+        h.controller.setEnabled(true)
+        XCTAssertEqual(h.controller.phase, .off)
+        XCTAssertTrue(h.recorder.sessions.isEmpty)
+        gate.release()
+        await refresh.value
+        XCTAssertTrue(h.controller.canEnable)
+    }
+
+    func testDriverInstallFailureStopsAtOnce() async {
+        let h = Harness(installer: { throw DriverInstaller.Failure.failed("cancelled") })
+        h.controller.installDriver()
+        await spin(until: { !h.controller.isInstallingDriver }, timeout: 0.5)
+        XCTAssertFalse(h.controller.isInstallingDriver, "no 10 s of polling after a failed install")
+        XCTAssertNotNil(h.controller.driverInstallError)
+    }
+
+    func testLaunchRestoresAnOutputLeftOnHiResBuddy() {
+        let h = Harness()
+        h.defaults.set(xm4Output.uid, forKey: OutputDeviceSwitcher.Keys.previousUID)   // written by the crashed run
+        h.defaults.set(xm4Output.name, forKey: OutputDeviceSwitcher.Keys.previousName)
+        h.directory.defaultOutput = hiresBuddy.id
+        let relaunched = h.makeController()
+        relaunched.restoreStuckOutput()
+        XCTAssertEqual(h.directory.defaultOutput, xm4Output.id)
+        XCTAssertNil(h.defaults.string(forKey: OutputDeviceSwitcher.Keys.previousUID))
+    }
+
+    func testEnablePersistsThePreviousOutput() async {
+        let h = Harness()
+        await h.controller.refreshHeadphones()
+        h.controller.setEnabled(true)
+        XCTAssertEqual(h.defaults.string(forKey: OutputDeviceSwitcher.Keys.previousUID), xm4Output.uid)
+        h.controller.setEnabled(false)
+    }
+
+    func testDescribeIncludesTheCodeForOpenFailures() {
+        let open = NSError(domain: HBErrorDomain, code: HBSessionError.errorChannelOpenFailed.rawValue,
+                           userInfo: [NSLocalizedDescriptionKey: "signaling channel open failed after 10 attempts"])
+        let text = SessionController.describe(open)
+        XCTAssertTrue(text.contains("код 4") && text.contains("after 10 attempts"), text)
+        let api = NSError(domain: HBErrorDomain, code: HBSessionError.errorPrivateAPIUnavailable.rawValue,
+                          userInfo: [NSLocalizedDescriptionKey: "private Bluetooth API unavailable"])
+        XCTAssertTrue(SessionController.describe(api).contains("код 7"), SessionController.describe(api))
+    }
+
     /// Yields the main actor (the controller's timers run on the main queue) until `done` or the timeout.
     private func spin(until done: () -> Bool, timeout: TimeInterval = 3) async {
         let end = Date(timeIntervalSinceNow: timeout)
@@ -174,16 +314,32 @@ private final class Harness {
     let defaults: UserDefaults
     let recorder = SessionRecorder()
     var controller: SessionController!
+    private let paired: [Headphones]
+    private let probe: @MainActor (Headphones) async -> Headphones
+    private let installer: @MainActor () async throws -> Void
+    private let timing: SessionController.Timing
 
-    init(paired: [Headphones] = [xm4]) {
+    static let fastTiming = SessionController.Timing(reconnectPoll: 0.01, restoreRetry: 0.01, closeTimeout: 0.5)
+
+    init(paired: [Headphones] = [xm4], probe: @escaping @MainActor (Headphones) async -> Headphones = { $0 },
+         installer: @escaping @MainActor () async throws -> Void = {}, timing: SessionController.Timing = fastTiming) {
         directory = FakeDirectory([speakers, xm4Output, hiresBuddy], defaultOutput: xm4Output.id)
         let suite = "SessionControllerTests.\(UUID())"
         defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
-        controller = SessionController(
+        self.paired = paired
+        self.probe = probe
+        self.installer = installer
+        self.timing = timing
+        controller = makeController()
+    }
+
+    /// A controller over the same fakes and defaults (e.g. a relaunch).
+    func makeController() -> SessionController {
+        SessionController(
             defaults: defaults,
-            listPaired: { paired },
-            probe: { $0 },
+            listPaired: { [paired] in paired },
+            probe: probe,
             makeSession: { [directory, recorder] device in
                 recorder.addresses.append(device.addressString.lowercased().replacingOccurrences(of: ":", with: "-"))
                 directory.devices.removeAll { $0.uid == xm4Output.uid }   // takeover: the headphones' output goes
@@ -192,10 +348,28 @@ private final class Harness {
                 return s
             },
             makeCapture: { [capture] in capture },
-            switcher: OutputDeviceSwitcher(directory: directory),
+            switcher: OutputDeviceSwitcher(directory: directory, defaults: defaults),
             isConnected: { [link] _ in link.next() },
             requestMicrophone: { $0(true) },   // synchronous: the tests drive the phases step by step
-            timing: .init(reconnectPoll: 0.01, restoreRetry: 0.01, closeTimeout: 0.5))
+            installer: installer,
+            timing: timing)
+    }
+}
+
+/// A probe that waits until released.
+@MainActor
+private final class ProbeGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    var waiting: Bool { continuation != nil }
+
+    func probe(_ h: Headphones) async -> Headphones {
+        await withCheckedContinuation { continuation = $0 }
+        return h
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 
@@ -237,8 +411,12 @@ private final class FakeDirectory: AudioDeviceDirectory {
 private final class FakeCapture: PCMSource {
     private(set) var started = false
     private(set) var stopped = false
+    var startError: (any Error)?
+    private var failureHandler: (@MainActor (any Error) -> Void)?
     func start(_ sink: @escaping (UnsafeBufferPointer<Float>) -> Void) { started = true }
     func stop() { stopped = true }
+    func onFailure(_ handler: @escaping @MainActor (any Error) -> Void) { failureHandler = handler }
+    @MainActor func fail(_ error: Error) { failureHandler?(error) }
 }
 
 /// Moves only when told to (start stays in Idle); stop goes to Closed. Owns a socketpair as the transport.

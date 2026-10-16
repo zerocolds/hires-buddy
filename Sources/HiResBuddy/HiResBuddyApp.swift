@@ -22,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var signalSources: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        signal(SIGPIPE, SIG_IGN)   // a dead socket must surface as EPIPE, never kill the app
+        // A crash can leave "HiRes Buddy" as the default output: put the remembered one back first.
+        controller.restoreStuckOutput()
         // kill / Ctrl-C take the same way out as «Выход»: never leave the output stuck on HiRes Buddy.
         signalSources = [SIGTERM, SIGINT, SIGHUP].map { sig in
             signal(sig, SIG_IGN)
