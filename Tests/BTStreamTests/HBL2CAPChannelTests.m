@@ -1,4 +1,5 @@
 #import <XCTest/XCTest.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #import "BTStream.h"
@@ -61,8 +62,10 @@
 - (void)testWriteSendsOneMessageToPeer {
     NSData *sdu = [NSData dataWithBytes:(uint8_t[]){ 0x10, 0x01 } length:2];
     XCTAssertTrue([_channel write:sdu]);
+    struct pollfd p = { .fd = _peer, .events = POLLIN };
+    XCTAssertEqual(poll(&p, 1, 2000), 1, @"nothing arrived at the peer within 2 s");
     uint8_t buf[16];
-    ssize_t n = read(_peer, buf, sizeof buf);
+    ssize_t n = (p.revents & POLLIN) ? read(_peer, buf, sizeof buf) : -1;
     XCTAssertEqualObjects([NSData dataWithBytes:buf length:MAX(n, 0)], sdu);
 }
 
@@ -72,8 +75,16 @@
     [self waitForExpectationsWithTimeout:2 handler:nil];
 }
 
-- (void)testWriteAfterCloseFails {
+- (void)testWriteAfterCloseFailsAndResetsSocketFD {
     [_channel close];
+    XCTAssertEqual(_channel.socketFD, -1);
+    XCTAssertFalse([_channel write:[NSData dataWithBytes:"x" length:1]]);
+}
+
+- (void)testWriteToClosedPeerFailsWithoutSIGPIPE {
+    _channel.delegate = nil;            // the close event may arrive while the run loop spins elsewhere
+    close(_peer); _peer = -1;
+    // Without SO_NOSIGPIPE this write raises SIGPIPE and kills the test process.
     XCTAssertFalse([_channel write:[NSData dataWithBytes:"x" length:1]]);
 }
 

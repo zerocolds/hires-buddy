@@ -44,6 +44,7 @@ typedef NS_ENUM(uint8_t, HBAVDTPSignal) {
 @class HBL2CAPChannel;
 
 @protocol HBL2CAPChannelDelegate <NSObject>
+/// `data` is whatever one socket read returned (up to 2048 bytes) — not guaranteed to be exactly one AVDTP message.
 - (void)channel:(HBL2CAPChannel *)c didReceive:(NSData *)data;
 - (void)channelDidClose:(HBL2CAPChannel *)c;
 @end
@@ -51,16 +52,19 @@ typedef NS_ENUM(uint8_t, HBAVDTPSignal) {
 /// One L2CAP channel backed by a SOCK_STREAM socket; delegate callbacks arrive on the main run loop.
 @interface HBL2CAPChannel : NSObject
 /// Opens a PSM on an already-connected device through CBClassicPeer (see HBPrivateAPI.h). Completion on the main queue.
+/// Only one open may be pending per device at a time: the peer has a single connect callback, and a second
+/// call overwrites the first one's completion. The channel keeps the peer alive until `close`.
 + (void)openPSM:(uint16_t)psm onDevice:(IOBluetoothDevice *)dev completion:(void (^)(HBL2CAPChannel * _Nullable ch, NSInteger code))completion;
-/// Wraps a ready socket (fd handed over by the helper process). `close` closes the fd.
-- (instancetype)initWithSocketFD:(int)fd name:(NSString *)name;
+/// Wraps a ready socket (fd handed over by the helper process). `close` closes the fd. nil if streams cannot be created.
+- (nullable instancetype)initWithSocketFD:(int)fd name:(NSString *)name;
 - (instancetype)init NS_UNAVAILABLE;
 @property(weak, nullable) id<HBL2CAPChannelDelegate> delegate;
+/// -1 after `close`.
 @property(readonly) int socketFD;
 /// 0 when unknown (bare fd).
 @property(readonly) uint16_t outgoingMTU;
 @property(readonly, copy) NSString *name;
-/// One write() = one SDU; NO on a short write or error.
+/// One write() = one SDU; NO on a short write or error (logged with errno). Never raises SIGPIPE.
 - (BOOL)write:(NSData *)data;
 - (void)close;
 @end
