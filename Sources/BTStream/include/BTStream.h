@@ -118,7 +118,11 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 - (instancetype)initWithDevice:(IOBluetoothDevice *)dev helper:(HBTransportHelperClient *)helper;
 /// For tests: the signaling channel is already open (no takeover, no device), and `provider` stands in for the
 /// helper — it is called after OPEN is accepted and must call its argument (on the main queue) with an fd, or -1.
-- (instancetype)initWithSignalingChannel:(HBL2CAPChannel *)sig transportProvider:(void (^)(void (^)(int fd)))provider;
+- (instancetype)initWithSignalingChannel:(nullable HBL2CAPChannel *)sig transportProvider:(void (^)(void (^)(int fd)))provider;
+/// For tests: no device (treated as connected); `opener` stands in for opening the signaling PSM and may call its
+/// argument (on the main queue) with a channel, or nil and an error code — or never, to simulate a lost callback.
+- (instancetype)initWithSignalingOpener:(void (^)(void (^)(HBL2CAPChannel * _Nullable ch, NSInteger code)))opener
+                      transportProvider:(void (^)(void (^)(int fd)))provider;
 - (instancetype)init NS_UNAVAILABLE;
 @property(weak, nullable) id<HBAVDTPSessionDelegate> delegate;
 @property(readonly) HBSessionState state;
@@ -135,9 +139,19 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 @property(copy, nullable) void (^restoreHook)(void);
 /// Deadline for each sink answer during setup/suspend/resume (default 5 s) -> Failed HBErrorTimeout.
 @property NSTimeInterval transactionTimeout;
-/// Full path to Streaming: takeover if the device is connected (closeConnection, then the signaling channel with
-/// up to 8 retries 2 s apart), DISCOVER, GET_CAPABILITIES until a sink offers LDAC at sfBit in
-/// stereo, SET_CONFIGURATION, OPEN, transport, START.
+/// Deadline for one signaling-channel open (default 3 s); no callback by then counts as a failed attempt.
+@property NSTimeInterval signalingOpenTimeout;
+/// Pause between failed signaling-open attempts (default 1 s).
+@property NSTimeInterval openRetryInterval;
+/// Signaling-open attempts before Failed HBErrorChannelOpenFailed (default 10).
+@property NSInteger maxOpenAttempts;
+/// Called on the main queue with every session log line (also sent to os_log, subsystem HiResBuddy).
+@property(copy, nullable) void (^logHandler)(NSString *message);
+/// Full path to Streaming: if the device is connected, takeover (closeConnection, first attempt 1 s later). Then
+/// signaling-open attempts (up to maxOpenAttempts, openRetryInterval apart): when the baseband link is down,
+/// openConnection and wait for it (connectionComplete or isConnected, at most 10 s); then open PSM 0x19 with a
+/// signalingOpenTimeout deadline (a channel arriving after its deadline is closed). Then DISCOVER,
+/// GET_CAPABILITIES until a sink offers LDAC at sfBit in stereo, SET_CONFIGURATION, OPEN, transport, START.
 /// Only from Idle.
 - (void)startWithSampleRateBit:(uint8_t)sfBit;
 /// Streaming -> Suspended (SUSPEND) and back (START).

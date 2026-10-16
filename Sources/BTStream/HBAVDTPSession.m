@@ -15,14 +15,16 @@ static os_log_t HBLog(void) {
     return log;
 }
 #define HBLOG(fmt, ...) os_log(HBLog(), "%{public}@", [NSString stringWithFormat:fmt, ##__VA_ARGS__])
+/// Instance-side logging: os_log plus the session's logHandler.
+#define SLOG(fmt, ...) [self log:[NSString stringWithFormat:fmt, ##__VA_ARGS__]]
 
 static const uint16_t kAVDTPPSM = 0x19;
 static const uint8_t kIntSEID = 1;
 static const uint8_t kLDACChannelModeStereo = 0x01;
 static const uint8_t kMsgCommand = 0, kMsgAccept = 2;
-static const int kOpenRetries = 8;
-static const int64_t kTakeoverDelay = 1500 * NSEC_PER_MSEC;   // baseband drop before asking for the channel
-static const int64_t kRetryDelay = 2 * NSEC_PER_SEC;          // the sink needs seconds to answer paging after a drop
+static const int64_t kTakeoverDelay = 1000 * NSEC_PER_MSEC;   // first signaling attempt after dropping the link
+static const NSTimeInterval kConnectPollInterval = 0.2;        // while paging: how often isConnected is checked
+static const NSTimeInterval kConnectTimeout = 10.0;            // paging deadline per attempt
 static const int64_t kReconnectDelay = 1500 * NSEC_PER_MSEC;
 static const NSTimeInterval kStopStepTimeout = 1.0;
 
@@ -30,6 +32,7 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
     IOBluetoothDevice *_dev;                    // nil for the test init
     HBTransportHelperClient *_helper;
     void (^_transportProvider)(void (^)(int fd));
+    void (^_signalingOpener)(void (^)(HBL2CAPChannel *ch, NSInteger code));   // openPSM stand-in (test init)
     HBL2CAPChannel *_sig;
     uint8_t _label;
     uint8_t _sfBit;
@@ -38,7 +41,9 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
     HBAVDTPSignal _pending;                     // command we wait a response for; 0 = none
     uint8_t _pendingLabel;
     NSUInteger _txToken;                        // bumped per response/timeout: stale transaction deadlines bail out
-    int _retries;
+    int _openAttempts;                          // signaling open attempts made so far
+    NSUInteger _attemptToken;                   // bumped when an attempt ends: stale callbacks/deadlines bail out
+    NSUInteger _pagingToken;                    // attempt waiting for the baseband connection; 0 = none
     NSUInteger _epoch;                          // bumped on stop/failure: stale timers and callbacks bail out
     BOOL _stopping;
     BOOL _tookOver;                             // we dropped macOS's link: failure must give A2DP back too
@@ -51,6 +56,9 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
     _helper = helper;
     _transportFD = -1;
     _transactionTimeout = 5.0;
+    _signalingOpenTimeout = 3.0;
+    _openRetryInterval = 1.0;
+    _maxOpenAttempts = 10;
     NSString *addr = dev.addressString;
     _transportProvider = ^(void (^done)(int)) {
         [helper openTransportForAddress:addr psm:kAVDTPPSM completion:^(int fd, NSInteger code) {
@@ -71,13 +79,28 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
     return self;
 }
 
-- (instancetype)initWithSignalingChannel:(HBL2CAPChannel *)sig transportProvider:(void (^)(void (^)(int)))provider {
+- (instancetype)initWithSignalingChannel:(nullable HBL2CAPChannel *)sig transportProvider:(void (^)(void (^)(int)))provider {
     if (!(self = [super init])) return nil;
     _transportFD = -1;
     _transactionTimeout = 5.0;
+    _signalingOpenTimeout = 3.0;
+    _openRetryInterval = 1.0;
+    _maxOpenAttempts = 10;
     _transportProvider = [provider copy];
     [self adoptSignaling:sig];
     return self;
+}
+
+- (instancetype)initWithSignalingOpener:(void (^)(void (^)(HBL2CAPChannel *, NSInteger)))opener
+                      transportProvider:(void (^)(void (^)(int)))provider {
+    if (!(self = [self initWithSignalingChannel:nil transportProvider:provider])) return nil;
+    _signalingOpener = [opener copy];
+    return self;
+}
+
+- (void)log:(NSString *)msg {
+    os_log(HBLog(), "%{public}@", msg);
+    if (self.logHandler) self.logHandler(msg);
 }
 
 - (void)dealloc {
@@ -141,7 +164,7 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
 
 - (void)failWithCode:(HBSessionError)code message:(NSString *)msg {
     if (self.isFinished) return;
-    HBLOG(@"failed: %@", msg);
+    SLOG(@"failed: %@", msg);
     [self finishWithState:HBSessionFailed
                     error:[NSError errorWithDomain:HBErrorDomain code:code userInfo:@{ NSLocalizedDescriptionKey: msg }]
                   restore:_tookOver];
@@ -174,7 +197,7 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
 }
 
 - (void)transactionTimedOut:(HBAVDTPSignal)sig {
-    HBLOG(@"no answer to signal %d", sig);
+    SLOG(@"no answer to signal %d", sig);
     if (_stopping) { [self stopStepDone]; return; }
     [self failWithCode:HBErrorTimeout message:[NSString stringWithFormat:@"sink did not answer signal %d", sig]];
 }
@@ -192,19 +215,20 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
 #pragma mark - Start
 
 - (void)startWithSampleRateBit:(uint8_t)sfBit {
-    if (_state != HBSessionIdle) { HBLOG(@"start ignored in state %ld", (long)_state); return; }
+    if (_state != HBSessionIdle) { SLOG(@"start ignored in state %ld", (long)_state); return; }
     _sfBit = sfBit;
     NSUInteger epoch = _epoch;
     [self setState:HBSessionConnecting error:nil];
     if (_epoch != epoch) return;                                // the delegate stopped us
     if (_sig) { [self sendOrFail:HBAVDTPDiscover payload:nil]; return; }
-    if (!_dev.isConnected) { [self openSignaling]; return; }   // bluetoothd brings the ACL up for our request
-    // The sink holds one AVDTP session and macOS owns it: drop the baseband link and ask for the channel while
-    // it is down, so our connect request goes out before bluetoothd's own A2DP logic.
-    HBLOG(@"taking over: dropping the baseband link");
+    if (!_dev.isConnected) { [self openSignalingAttempt]; return; }
+    // The sink holds one AVDTP session and macOS owns it: drop the baseband link and ask for the channel early,
+    // after bluetoothd has torn down its A2DP channels but (ideally) before the ACL goes — our channel then keeps
+    // the link up. If the ACL drops anyway, the attempt loop pages the device again.
+    SLOG(@"taking over: dropping the baseband link");
     _tookOver = YES;
     [_dev closeConnection];
-    [self after:kTakeoverDelay do:^(HBAVDTPSession *me) { [me openSignaling]; }];
+    [self after:kTakeoverDelay do:^(HBAVDTPSession *me) { [me openSignalingAttempt]; }];
 }
 
 /// Runs `block` on the main queue after `delay` unless the session was stopped/failed or released meanwhile.
@@ -217,27 +241,88 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
     });
 }
 
-- (void)openSignaling {
-    NSUInteger epoch = _epoch;
-    __weak HBAVDTPSession *weakSelf = self;
-    [HBL2CAPChannel openPSM:kAVDTPPSM onDevice:_dev completion:^(HBL2CAPChannel *ch, NSInteger code) {
-        HBAVDTPSession *me = weakSelf;
-        if (!me || me->_epoch != epoch) { [ch close]; return; }
-        [me signalingOpened:ch code:code];
+- (int64_t)nanoseconds:(NSTimeInterval)t { return (int64_t)(t * NSEC_PER_SEC); }
+
+/// One attempt: page the device if its baseband link is down, then open the signaling PSM. Every attempt ends in
+/// exactly one of signalingOpened:, or attemptFailed: (open error, open deadline, paging failure/deadline).
+- (void)openSignalingAttempt {
+    if (self.isFinished) return;
+    _openAttempts++;
+    NSUInteger token = ++_attemptToken;
+    if (_dev && !_dev.isConnected) {
+        SLOG(@"signaling attempt %d/%ld: device not connected, paging", _openAttempts, (long)self.maxOpenAttempts);
+        _pagingToken = token;
+        IOReturn rc = [_dev openConnection:self];
+        if (rc != kIOReturnSuccess) SLOG(@"openConnection returned 0x%x", rc);
+        [self pollConnectedForAttempt:token deadline:[NSDate dateWithTimeIntervalSinceNow:kConnectTimeout]];
+        return;
+    }
+    SLOG(@"signaling attempt %d/%ld: opening PSM 0x19", _openAttempts, (long)self.maxOpenAttempts);
+    [self openPSMForAttempt:token];
+}
+
+- (void)pollConnectedForAttempt:(NSUInteger)token deadline:(NSDate *)deadline {
+    [self after:[self nanoseconds:kConnectPollInterval] do:^(HBAVDTPSession *me) {
+        if (me->_pagingToken != token || me->_attemptToken != token) return;   // connectionComplete got there first
+        if (me->_dev.isConnected) {
+            me->_pagingToken = 0;
+            [me openPSMForAttempt:token];
+        } else if (deadline.timeIntervalSinceNow <= 0) {
+            me->_pagingToken = 0;
+            [me attemptFailed:token reason:@"paging timed out"];
+        } else {
+            [me pollConnectedForAttempt:token deadline:deadline];
+        }
     }];
 }
 
-- (void)signalingOpened:(HBL2CAPChannel *)ch code:(NSInteger)code {
-    if (!ch) {
-        if (++_retries <= kOpenRetries) {
-            HBLOG(@"signaling open failed (code %ld), retry %d in 2 s", (long)code, _retries);
-            [self after:kRetryDelay do:^(HBAVDTPSession *me) { [me openSignaling]; }];
-        } else {
-            [self failWithCode:HBErrorChannelOpenFailed
-                       message:[NSString stringWithFormat:@"signaling channel open failed (code %ld)", (long)code]];
+/// IOBluetooth's openConnection: target. Main thread.
+- (void)connectionComplete:(IOBluetoothDevice *)dev status:(IOReturn)status {
+    SLOG(@"baseband connect: status 0x%x", status);
+    NSUInteger token = _pagingToken;
+    if (!token || token != _attemptToken || _stopping || self.isFinished) return;
+    _pagingToken = 0;
+    if (status == kIOReturnSuccess) [self openPSMForAttempt:token];
+    else [self attemptFailed:token reason:[NSString stringWithFormat:@"paging failed (0x%x)", status]];
+}
+
+- (void)openPSMForAttempt:(NSUInteger)token {
+    NSUInteger epoch = _epoch;
+    __weak HBAVDTPSession *weakSelf = self;
+    void (^done)(HBL2CAPChannel *, NSInteger) = ^(HBL2CAPChannel *ch, NSInteger code) {
+        HBAVDTPSession *me = weakSelf;
+        if (!me || me->_epoch != epoch || me->_attemptToken != token) {   // stopped, or this attempt timed out
+            [ch close];
+            return;
         }
-        return;
+        me->_attemptToken++;
+        if (ch) [me signalingOpened:ch];
+        else [me attemptFailed:0 reason:[NSString stringWithFormat:@"open failed (code %ld)", (long)code]];
+    };
+    if (_signalingOpener) _signalingOpener(done);
+    else [HBL2CAPChannel openPSM:kAVDTPPSM onDevice:_dev completion:done];
+    [self after:[self nanoseconds:self.signalingOpenTimeout] do:^(HBAVDTPSession *me) {
+        if (me->_attemptToken == token) [me attemptFailed:token reason:@"open did not complete in time"];
+    }];
+}
+
+/// `token` 0: the caller already ended the attempt.
+- (void)attemptFailed:(NSUInteger)token reason:(NSString *)reason {
+    if (token) {
+        if (_attemptToken != token) return;
+        _attemptToken++;
     }
+    if (_openAttempts < self.maxOpenAttempts) {
+        SLOG(@"signaling attempt %d: %@, retrying in %.1f s", _openAttempts, reason, self.openRetryInterval);
+        [self after:[self nanoseconds:self.openRetryInterval] do:^(HBAVDTPSession *me) { [me openSignalingAttempt]; }];
+    } else {
+        [self failWithCode:HBErrorChannelOpenFailed
+                   message:[NSString stringWithFormat:@"signaling channel open failed after %d attempts (%@)",
+                                                      _openAttempts, reason]];
+    }
+}
+
+- (void)signalingOpened:(HBL2CAPChannel *)ch {
     [self adoptSignaling:ch];
     [self sendOrFail:HBAVDTPDiscover payload:nil];
 }
@@ -278,7 +363,7 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
     if (type == kMsgCommand) { [self handleSinkCommand:msg signal:sig channel:c]; return; }
     if (!_pending || sig != _pending || label != _pendingLabel) {
         // not an answer to our open transaction: e.g. bluetoothd's own A2DP retries (~every 10 s) land here
-        HBLOG(@"ignoring response type %d to signal %d label %d", type, sig, label);
+        SLOG(@"ignoring response type %d to signal %d label %d", type, sig, label);
         return;
     }
     if (_stopping) { [self stopStepDone]; return; }   // accept or reject: either way the step is over
@@ -290,7 +375,7 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
             [self failWithCode:HBErrorSinkRejected
                        message:[NSString stringWithFormat:@"sink rejected signal %d (error 0x%02x)", sig, errCode]];
         } else {
-            HBLOG(@"sink refused signal %d (error 0x%02x), state unchanged", sig, errCode);
+            SLOG(@"sink refused signal %d (error 0x%02x), state unchanged", sig, errCode);
         }
         return;
     }
@@ -333,7 +418,7 @@ static const NSTimeInterval kStopStepTimeout = 1.0;
         HBAVDTPEndpoint *ep = [HBAVDTPEndpoint new];
         [HBAVDTP parseCapabilities:msg into:ep];
         if (ep.supportsLDAC)
-            HBLOG(@"LDAC endpoint seid=%d rates=0x%02x modes=0x%02x", _acp, ep.ldacSampleRates, ep.ldacChannelModes);
+            SLOG(@"LDAC endpoint seid=%d rates=0x%02x modes=0x%02x", _acp, ep.ldacSampleRates, ep.ldacChannelModes);
         if (![self endpointFits:ep]) { [self queryNextCapabilities]; break; }
         [self sendOrFail:HBAVDTPSetConfiguration
                  payload:[HBAVDTP setConfigurationPayloadForSEID:_acp intSEID:kIntSEID ldacSampleRateBit:_sfBit

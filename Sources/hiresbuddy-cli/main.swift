@@ -53,6 +53,7 @@ guard let device = IOBluetoothDevice(addressString: address) else { die("bad add
 _ = IOBluetoothDevice.pairedDevices()   // warms up the IOBluetooth/CoreBluetooth bridge
 
 let session = HBAVDTPSession(device: device, helper: HBTransportHelperClient())
+session.logHandler = { printError("session: \($0)") }
 let streamer = Streamer(session: session, sampleRate: wav.sampleRate, quality: quality)
 print(String(format: "%@: %d Hz, %.1f s → %@ (%@), LDAC %@",
              wavPath, wav.sampleRate.rawValue, wav.duration, device.name ?? "?", address, "\(quality)"))

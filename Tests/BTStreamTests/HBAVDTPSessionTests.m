@@ -257,4 +257,72 @@ static uint8_t SignalOf(NSData *msg) { return msg.length > 1 ? ((const uint8_t *
     XCTAssertEqual(_recorder.lastError.code, HBErrorNoLDAC);
 }
 
+#pragma mark - Signaling open attempts (test opener; paging/takeover need hardware)
+
+/// A fake signaling channel on a fresh socketpair; the peer end goes into `peers` for tearDown-free cleanup.
+- (HBFakeSignalingChannel *)newFakeChannelKeepingPeerIn:(NSMutableArray<NSNumber *> *)peers {
+    int sv[2];
+    XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    [peers addObject:@(sv[1])];
+    return [[HBFakeSignalingChannel alloc] initWithSocketFD:sv[0] name:@"fake-sig-2"];
+}
+
+- (void)spinUntil:(BOOL (^)(void))condition timeout:(NSTimeInterval)timeout {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (!condition() && deadline.timeIntervalSinceNow > 0)
+        [NSRunLoop.mainRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+}
+
+- (void)testSignalingOpenTimesOutAndRetries {
+    NSMutableArray<NSNumber *> *peers = [NSMutableArray array];
+    HBFakeSignalingChannel *second = [self newFakeChannelKeepingPeerIn:peers];
+    HBFakeSignalingChannel *late = [self newFakeChannelKeepingPeerIn:peers];
+    NSMutableArray *completions = [NSMutableArray array];
+    HBAVDTPSession *s = [[HBAVDTPSession alloc] initWithSignalingOpener:^(void (^done)(HBL2CAPChannel *, NSInteger)) {
+        [completions addObject:[done copy]];
+        if (completions.count == 2) done(second, 0);       // the first attempt never calls back
+    } transportProvider:^(void (^done)(int)) { done(-1); }];
+    s.signalingOpenTimeout = 0.1;
+    s.openRetryInterval = 0.05;
+    HBSessionRecorder *rec = [HBSessionRecorder new];
+    s.delegate = rec;
+
+    [s startWithSampleRateBit:0x10];
+    XCTAssertEqual(completions.count, 1u);
+    [self spinUntil:^BOOL { return second.sent.count > 0; } timeout:2];
+    XCTAssertEqual(completions.count, 2u, @"a second attempt follows the first one's deadline");
+    XCTAssertEqual(SignalOf(second.sent.lastObject), HBAVDTPDiscover);
+
+    // the first attempt's channel shows up after its deadline: closed and ignored
+    ((void (^)(HBL2CAPChannel *, NSInteger))completions[0])(late, 0);
+    XCTAssertEqual(late.socketFD, -1);
+    XCTAssertEqual(late.sent.count, 0u);
+    XCTAssertEqualObjects(rec.states, @[ @(HBSessionConnecting) ]);
+
+    s = nil;
+    for (NSNumber *fd in peers) close(fd.intValue);
+}
+
+- (void)testOpenAttemptsExhaustedFails {
+    __block int calls = 0;
+    HBAVDTPSession *s = [[HBAVDTPSession alloc] initWithSignalingOpener:^(void (^done)(HBL2CAPChannel *, NSInteger)) {
+        if (++calls == 2) done(nil, 5);                    // one explicit failure, the others never call back
+    } transportProvider:^(void (^done)(int)) { done(-1); }];
+    s.signalingOpenTimeout = 0.05;
+    s.openRetryInterval = 0.02;
+    s.maxOpenAttempts = 3;
+    HBSessionRecorder *rec = [HBSessionRecorder new];
+    s.delegate = rec;
+    NSMutableArray<NSString *> *logged = [NSMutableArray array];
+    s.logHandler = ^(NSString *m) { [logged addObject:m]; };
+
+    [s startWithSampleRateBit:0x10];
+    [self spinUntil:^BOOL { return s.state == HBSessionFailed; } timeout:2];
+    XCTAssertEqual(calls, 3);
+    XCTAssertEqualObjects(rec.states, (@[ @(HBSessionConnecting), @(HBSessionFailed) ]));
+    XCTAssertEqualObjects(rec.lastError.domain, HBErrorDomain);
+    XCTAssertEqual(rec.lastError.code, HBErrorChannelOpenFailed);
+    XCTAssertGreaterThanOrEqual(logged.count, 3u, @"each attempt is reported through logHandler");
+}
+
 @end
