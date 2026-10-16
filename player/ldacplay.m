@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include "ldacBT.h"
 
-static NSString *kAddr;         // headphone BT address, from LDAC_ADDR (e.g. 94-db-56-e1-43-75)
+static NSString *kAddr;         // headphone BT address, from LDAC_ADDR (e.g. 00-11-22-33-44-55)
 static int kSF = 44100;
 static int kWL = 2;             // bytes per sample
 static uint8_t kSFBit = LDACBT_SAMPLING_FREQ_044100;

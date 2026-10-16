@@ -3,7 +3,7 @@
 #import <IOBluetooth/IOBluetooth.h>
 #import <objc/runtime.h>
 #include <sys/socket.h>
-static NSString *const kAddr = @"94-db-56-e1-43-75";
+static NSString *const kAddr = @"00-00-00-00-00-00";   // set your headphone address
 @interface IOBluetoothDevice (Priv) - (id)classicPeer; @end
 @interface NSObject (CBPriv)
 - (void)setConnectL2CAPCallback:(void (^)(id ch, long code))cb;

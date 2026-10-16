@@ -2,7 +2,7 @@
 // modes: cb (open inside connect callback), delay (2s after callback), sync (openL2CAPChannelSync), paired (device from pairedDevices)
 #import <Foundation/Foundation.h>
 #import <IOBluetooth/IOBluetooth.h>
-static NSString *const kAddr = @"94-db-56-e1-43-75";
+static NSString *const kAddr = @"00-00-00-00-00-00";   // set your headphone address
 static const char *mode;
 @interface T : NSObject <IOBluetoothL2CAPChannelDelegate>
 @property(strong) IOBluetoothDevice *dev; @property(strong) IOBluetoothL2CAPChannel *ch; @property BOOL fired;
