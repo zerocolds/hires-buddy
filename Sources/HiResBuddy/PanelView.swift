@@ -17,8 +17,12 @@ struct PanelView: View {
                 .toggleStyle(.switch)
                 .disabled(isBusy || (!isOn && !controller.canEnable))
             if !isOn && !isBusy && !controller.canEnable { hint }
-            if controller.selected?.isConnected == true && controller.selected?.ldacSampleRates == nil {
-                Text("LDAC: не проверено").font(.caption).foregroundStyle(.secondary)
+            if !isOn && !isBusy, let selected = controller.selected, selected.isConnected {
+                switch selected.ldacSampleRates {
+                case nil: Text("LDAC: не проверено").font(.caption).foregroundStyle(.secondary)
+                case 0?: Text("Наушники не поддерживают LDAC (повторить попытку?)").font(.caption).foregroundStyle(.secondary)
+                default: EmptyView()
+                }
             }
             qualityPicker
             if let stats = controller.stats { statsBlock(stats) }
@@ -77,8 +81,6 @@ struct PanelView: View {
                     Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 }
             }
-        } else if controller.selected?.ldacSampleRates == 0 {
-            Text("Наушники не поддерживают LDAC").font(.caption).foregroundStyle(.secondary)
         } else {
             Text("Подключите наушники с LDAC").font(.caption).foregroundStyle(.secondary)
         }

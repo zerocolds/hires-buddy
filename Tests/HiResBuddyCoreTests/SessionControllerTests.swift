@@ -288,12 +288,13 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertTrue(relaunched.canEnable)
     }
 
-    func testNoLDACDeviceIsCachedAsZeroAndDisabled() async {
+    func testNoLDACDeviceIsCachedAsZeroButCanRetry() async {
         let h = Harness()
         h.controller.refreshHeadphones()
         XCTAssertTrue(h.controller.canEnable)
         h.controller.setEnabled(true)
         h.link.connected = [false, true]
+        h.recorder.sessions[0].sinkCount = 3              // free sink endpoints answered, none with LDAC
         h.recorder.sessions[0].move(to: .failed, error: HBSessionError(.errorNoLDAC))
         XCTAssertEqual(h.controller.phase, .error("Наушники не поддерживают LDAC"))
         XCTAssertEqual(h.defaults.object(forKey: "ldacRates.\(xm4.id)") as? Int, 0)
@@ -303,10 +304,43 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertFalse(h.controller.isReturningHeadphones)
 
         h.controller.refreshHeadphones()
-        XCTAssertEqual(h.controller.selected?.ldacSampleRates, 0, "stays known after a refresh")
-        XCTAssertFalse(h.controller.canEnable)
+        XCTAssertEqual(h.controller.selected?.ldacSampleRates, 0, "stays known after a refresh (shown as a hint)")
+        XCTAssertTrue(h.controller.canEnable, "a cached 0 never locks the device out")
         h.controller.setEnabled(true)
-        XCTAssertEqual(h.recorder.sessions.count, 1, "no new session for headphones without LDAC")
+        XCTAssertEqual(h.recorder.sessions.count, 2, "the retry starts a new session")
+        h.recorder.sessions[1].rates = 0x3C
+        h.recorder.sessions[1].move(to: .streaming)
+        XCTAssertEqual(h.defaults.object(forKey: "ldacRates.\(xm4.id)") as? Int, 0x3C, "a stream overwrites the 0")
+        XCTAssertEqual(h.controller.selected?.ldacSampleRates, 0x3C)
+        h.controller.setEnabled(false)
+    }
+
+    func testInUseEndpointsDoNotPoisonCache() async {
+        let h = Harness()
+        h.controller.refreshHeadphones()
+        h.controller.setEnabled(true)
+        h.link.connected = [false, true]
+        h.recorder.sessions[0].sinkCount = 0              // every sink endpoint in use (multipoint, another host)
+        h.recorder.sessions[0].move(to: .failed, error: HBSessionError(.errorNoLDAC))
+        guard case .error(let message) = h.controller.phase else { return XCTFail("phase \(h.controller.phase)") }
+        XCTAssertTrue(message.contains("занят"), message)
+        XCTAssertNil(h.defaults.object(forKey: "ldacRates.\(xm4.id)"), "nothing learned about LDAC")
+        XCTAssertNil(h.controller.selected?.ldacSampleRates)
+        h.directory.devices.append(xm4Output)
+        await spin(until: { !h.controller.isReturningHeadphones })
+        XCTAssertNil(h.controller.selected?.ldacSampleRates)
+        XCTAssertTrue(h.controller.canEnable)
+
+        // LDAC present but not at 48 kHz stereo: not "no LDAC" either
+        h.controller.setEnabled(true)
+        h.link.connected = [false, true]
+        h.recorder.sessions[1].sinkCount = 2
+        h.recorder.sessions[1].rates = 0x20
+        h.recorder.sessions[1].move(to: .failed, error: HBSessionError(.errorNoLDAC))
+        XCTAssertEqual(h.controller.phase, .error("Наушники не поддерживают LDAC 48 кГц стерео"))
+        XCTAssertNil(h.defaults.object(forKey: "ldacRates.\(xm4.id)"))
+        h.directory.devices.append(xm4Output)
+        await spin(until: { !h.controller.isReturningHeadphones })
     }
 
     func testDriverInstallFailureStopsAtOnce() async {
@@ -460,6 +494,7 @@ private final class FakeSession: HBAVDTPSession {
     private(set) var startedBit: UInt8 = 0
     private(set) var stopCalled = false
     var rates: UInt8 = 0
+    var sinkCount = 0
 
     init() {
         var sig: [Int32] = [-1, -1], transport: [Int32] = [-1, -1]
@@ -473,6 +508,7 @@ private final class FakeSession: HBAVDTPSession {
 
     override var state: HBSessionState { fakeState }
     override var discoveredLDACRates: UInt8 { rates }
+    override var discoveredSinkCount: UInt { UInt(sinkCount) }
     override var transportFD: Int32 { fakeState == .streaming || fakeState == .suspended ? fds[1] : -1 }
 
     override func start(withSampleRateBit sfBit: UInt8) {

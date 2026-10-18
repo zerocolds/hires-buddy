@@ -65,11 +65,12 @@ public final class SessionController: ObservableObject {
     /// The "HiRes Buddy" virtual device is present (as of the last `recheckDriver`).
     @Published public private(set) var driverInstalled = false
 
-    /// The selected headphones are connected, not known to lack LDAC (unknown is fine: a session without LDAC
-    /// fails fast with HBErrorNoLDAC), and the driver is installed.
+    /// The selected headphones are connected and the driver is installed. LDAC support does not gate it: unknown
+    /// is learned by trying (a session without LDAC fails fast with HBErrorNoLDAC), and a cached "no LDAC" is only
+    /// shown as a hint — the toggle stays available for a retry.
     public var canEnable: Bool {
         guard let selected else { return false }
-        return selected.isConnected && selected.ldacSampleRates != 0 && driverInstalled && !isReturningHeadphones
+        return selected.isConnected && driverInstalled && !isReturningHeadphones
     }
 
     /// A stream exists or the headphones are still on their way back to macOS: quitting must wait.
@@ -271,8 +272,11 @@ public final class SessionController: ObservableObject {
             sessionEnded(failed: false)
         case .failed:
             log.error("session failed: \(err.map { "\($0)" } ?? "?", privacy: .public)")
-            if phase != .stopping { phase = .error(Self.describe(err)) }
-            if Self.isNoLDAC(err) { rememberLDACRates(0, for: address) }
+            if phase != .stopping { phase = .error(Self.describe(err, session: session)) }
+            // "No LDAC" only when free sink endpoints answered and none had it; all in use says nothing.
+            if Self.isNoLDAC(err), let session, session.discoveredSinkCount > 0, session.discoveredLDACRates == 0 {
+                rememberLDACRates(0, for: address)
+            }
             let left = Self.isSinkDisconnected(err) && !isConnected(address)
             if left { log.info("the headphones left (link down): not waiting for a reconnect") }
             sessionEnded(failed: true, headphonesLeft: left)
@@ -428,6 +432,14 @@ public final class SessionController: ObservableObject {
     static func isNoLDAC(_ err: Error?) -> Bool {
         guard let e = err as NSError? else { return false }
         return e.domain == HBErrorDomain && e.code == HBSessionError.errorNoLDAC.rawValue
+    }
+
+    /// `describe`, telling apart the HBErrorNoLDAC cases the session can see.
+    static func describe(_ err: Error?, session: HBAVDTPSession?) -> String {
+        guard Self.isNoLDAC(err), let session else { return describe(err) }
+        if session.discoveredSinkCount == 0 { return "Аудиоканал наушников занят (другое устройство?) — повторите попытку" }
+        if session.discoveredLDACRates != 0 { return "Наушники не поддерживают LDAC 48 кГц стерео" }
+        return describe(err)
     }
 
     static func describe(_ err: Error?) -> String {

@@ -216,6 +216,17 @@ static uint8_t SignalOf(NSData *msg) { return msg.length > 1 ? ((const uint8_t *
         [_fake reply:HEX([label stringByAppendingString:@"2 02 01 00 07 06 00 00 ff ff 02 35"])];
     XCTAssertEqual(_session.state, HBSessionFailed);
     XCTAssertEqual(_recorder.lastError.code, HBErrorNoLDAC);
+    XCTAssertEqual(_session.discoveredSinkCount, 6u);
+    XCTAssertEqual(_session.discoveredLDACRates, 0x3c, @"LDAC is there, just not at this rate");
+}
+
+- (void)testAllSinkEndpointsInUseFailsWithoutLDACVerdict {
+    [_session startWithSampleRateBit:0x10];
+    [_fake reply:HEX(@"12 01 06 08 0a 08")];               // seid 1 and 2: sinks, both in use
+    XCTAssertEqual(_session.state, HBSessionFailed);
+    XCTAssertEqual(_recorder.lastError.code, HBErrorNoLDAC);
+    XCTAssertEqual(_session.discoveredSinkCount, 0u);
+    XCTAssertEqual(_session.discoveredLDACRates, 0);
 }
 
 - (void)testStopSendsSuspendCloseAndReconnects {
@@ -256,6 +267,8 @@ static uint8_t SignalOf(NSData *msg) { return msg.length > 1 ? ((const uint8_t *
     XCTAssertEqual(_session.state, HBSessionFailed);
     XCTAssertEqualObjects(_recorder.lastError.domain, HBErrorDomain);
     XCTAssertEqual(_recorder.lastError.code, HBErrorNoLDAC);
+    XCTAssertEqual(_session.discoveredSinkCount, 6u);
+    XCTAssertEqual(_session.discoveredLDACRates, 0, @"no endpoint had LDAC");
 }
 
 #pragma mark - Signaling open attempts (test opener; paging/takeover need hardware)

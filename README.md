@@ -62,8 +62,9 @@ nothing tries to page them.
 
 - **LDAC support is learned, not probed.** The app never queries headphones it is not streaming to; the
   list shows «LDAC не проверено» until the first stream. A stream that negotiates LDAC remembers the
-  headphones' LDAC rates; one that finds no LDAC endpoint says «Наушники не поддерживают LDAC» and the
-  toggle stays off for them from then on.
+  headphones' LDAC rates; one whose free endpoints have no LDAC says «Наушники не поддерживают LDAC»
+  and the panel keeps that as a hint, but the toggle stays available for a retry. When every endpoint is
+  busy (e.g. another host), nothing is remembered.
 
 `hiresbuddy-cli` (`swift run hiresbuddy-cli probe | play <wav> | system`) is the command-line
 equivalent, used for hardware testing. **Do not run `probe` while macOS is playing to (owns A2DP on) the

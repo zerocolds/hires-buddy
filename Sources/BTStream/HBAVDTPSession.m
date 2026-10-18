@@ -477,6 +477,7 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     _transportFD = -1;
     _negotiatedSampleRateBit = 0;
     _discoveredLDACRates = 0;
+    _discoveredSinkCount = 0;
     _openAttempts = 0;
     NSUInteger epoch = _epoch;
     [self setState:HBSessionConnecting error:nil];
@@ -514,6 +515,8 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
         _sinks = [NSMutableArray array];
         for (HBAVDTPEndpoint *ep in [HBAVDTP parseDiscover:msg])
             if (ep.isSink && !ep.inUse) [_sinks addObject:ep];
+        _discoveredSinkCount = _sinks.count;
+        _discoveredLDACRates = 0;
         [self queryNextCapabilities];
         break;
     case HBAVDTPGetCapabilities: {
@@ -521,8 +524,8 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
         [HBAVDTP parseCapabilities:msg into:ep];
         if (ep.supportsLDAC)
             SLOG(@"LDAC endpoint seid=%d rates=0x%02x modes=0x%02x", _acp, ep.ldacSampleRates, ep.ldacChannelModes);
+        if (ep.supportsLDAC) _discoveredLDACRates |= ep.ldacSampleRates;
         if (![self endpointFits:ep]) { [self queryNextCapabilities]; break; }
-        _discoveredLDACRates = ep.ldacSampleRates;
         [self sendOrFail:HBAVDTPSetConfiguration
                  payload:[HBAVDTP setConfigurationPayloadForSEID:_acp intSEID:kIntSEID ldacSampleRateBit:_sfBit
                                                   channelModeBit:kLDACChannelModeStereo]];
