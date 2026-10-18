@@ -8,8 +8,8 @@ public struct Headphones: Identifiable, Hashable, Sendable {
     public let id: String
     public let name: String
     public let isConnected: Bool
-    /// LDAC sample-rate bit mask (0x20 44.1, 0x10 48, 0x08 88.2, 0x04 96 kHz). nil = not probed or unknown
-    /// (the sink did not answer); 0 = the sink answered and has no LDAC endpoint.
+    /// LDAC sample-rate bit mask (0x20 44.1, 0x10 48, 0x08 88.2, 0x04 96 kHz). nil = unknown (never streamed to
+    /// and not probed, or the sink did not answer); 0 = known to have no usable LDAC endpoint.
     public let ldacSampleRates: UInt8?
 
     public init(id: String, name: String, isConnected: Bool, ldacSampleRates: UInt8?) {
@@ -38,14 +38,21 @@ public enum HeadphoneDiscovery {
     /// Asks a connected sink for its LDAC capabilities over a short-lived signaling channel (DISCOVER, then
     /// GET_CAPABILITIES per sink endpoint; nothing else is sent). The sink may refuse the channel or stay silent
     /// while macOS owns A2DP: then the result is unknown (`ldacSampleRates == nil`), never "no LDAC".
+    ///
+    /// Diagnostic only (`hiresbuddy-cli probe`): never call it while macOS owns A2DP on the device. Opening PSM 0x19
+    /// next to bluetoothd's own AVDTP session makes the sink drop the baseband link about 5 s later; macOS loses the
+    /// audio and the headphones do not reconnect by themselves. The app never probes: it learns LDAC support from
+    /// its first session (`HBAVDTPSession.discoveredLDACRates`).
+    @MainActor
     public static func probeLDAC(_ h: Headphones) async -> Headphones {
-        await probeLDAC(h, opener: openSignalingChannel, timeout: 5)
+        await probeLDAC(h, opener: channelOpener, timeout: 5)
     }
 
     /// Opens a PSM on the (already connected) device with this address; completion on the main queue.
     typealias ChannelOpener = @MainActor (String, UInt16, @escaping (HBL2CAPChannel?, Int) -> Void) -> Void
 
-    private static let openSignalingChannel: ChannelOpener = { address, psm, completion in
+    /// The real L2CAP open used by `probeLDAC`. Test seam: tests swap it to see whether anything opens a channel.
+    @MainActor static var channelOpener: ChannelOpener = { address, psm, completion in
         guard let device = IOBluetoothDevice(addressString: address) else { return completion(nil, -1) }
         HBL2CAPChannel.openPSM(psm, on: device, completion: completion)
     }

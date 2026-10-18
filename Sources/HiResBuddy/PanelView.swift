@@ -15,15 +15,18 @@ struct PanelView: View {
             header
             Toggle("Hi-Res (LDAC)", isOn: Binding(get: { isOn }, set: { controller.setEnabled($0) }))
                 .toggleStyle(.switch)
-                .disabled(isBusy || (!isOn && !controller.canEnable))   // canEnable is false while a refresh probes
-            if !isOn && !isBusy && !controller.canEnable && !controller.isRefreshing { hint }
+                .disabled(isBusy || (!isOn && !controller.canEnable))
+            if !isOn && !isBusy && !controller.canEnable { hint }
+            if controller.selected?.isConnected == true && controller.selected?.ldacSampleRates == nil {
+                Text("LDAC: не проверено").font(.caption).foregroundStyle(.secondary)
+            }
             qualityPicker
             if let stats = controller.stats { statsBlock(stats) }
             Divider()
             headphonePicker
             HStack {
-                Button("Обновить список") { Task { await controller.refreshHeadphones() } }
-                    .disabled(isBusy || isOn || controller.isRefreshing)
+                Button("Обновить список") { controller.refreshHeadphones() }
+                    .disabled(isBusy || isOn)
                 Spacer()
                 Button("Выход") { controller.quit() }   // never disabled: a second press stops any wait
             }
@@ -32,7 +35,7 @@ struct PanelView: View {
         .frame(width: 320)
         .task {
             controller.recheckDriver()
-            await controller.refreshHeadphones()
+            controller.refreshHeadphones()
         }
     }
 
@@ -75,7 +78,7 @@ struct PanelView: View {
                 }
             }
         } else if controller.selected?.ldacSampleRates == 0 {
-            Text("Эти наушники не поддерживают LDAC").font(.caption).foregroundStyle(.secondary)
+            Text("Наушники не поддерживают LDAC").font(.caption).foregroundStyle(.secondary)
         } else {
             Text("Подключите наушники с LDAC").font(.caption).foregroundStyle(.secondary)
         }
@@ -123,7 +126,7 @@ struct PanelView: View {
         guard h.isConnected else { return "\(h.name) — не подключены" }
         switch h.ldacSampleRates {
         case 0?: return "\(h.name) — без LDAC"
-        case nil: return h.name
+        case nil: return "\(h.name) — LDAC не проверено"
         default: return "\(h.name) — LDAC"
         }
     }

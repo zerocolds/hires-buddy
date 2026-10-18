@@ -126,6 +126,7 @@ static uint8_t SignalOf(NSData *msg) { return msg.length > 1 ? ((const uint8_t *
     XCTAssertEqual(((const uint8_t *)_fake.sent.lastObject.bytes)[1], HBAVDTPStart);
     XCTAssertEqual(_session.transportFD, _providedFD);
     XCTAssertEqual(_session.negotiatedSampleRateBit, 0x10);
+    XCTAssertEqual(_session.discoveredLDACRates, 0x3c);
     XCTAssertEqualObjects(_recorder.states, (@[ @(HBSessionConnecting), @(HBSessionConfigured), @(HBSessionStreaming) ]));
 }
 

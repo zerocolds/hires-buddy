@@ -476,6 +476,7 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
     if (_transportFD >= 0) close(_transportFD);
     _transportFD = -1;
     _negotiatedSampleRateBit = 0;
+    _discoveredLDACRates = 0;
     _openAttempts = 0;
     NSUInteger epoch = _epoch;
     [self setState:HBSessionConnecting error:nil];
@@ -521,6 +522,7 @@ static void HBReconnectWhenDown(IOBluetoothDevice *dev, int checksLeft) {
         if (ep.supportsLDAC)
             SLOG(@"LDAC endpoint seid=%d rates=0x%02x modes=0x%02x", _acp, ep.ldacSampleRates, ep.ldacChannelModes);
         if (![self endpointFits:ep]) { [self queryNextCapabilities]; break; }
+        _discoveredLDACRates = ep.ldacSampleRates;
         [self sendOrFail:HBAVDTPSetConfiguration
                  payload:[HBAVDTP setConfigurationPayloadForSEID:_acp intSEID:kIntSEID ldacSampleRateBit:_sfBit
                                                   channelModeBit:kLDACChannelModeStereo]];

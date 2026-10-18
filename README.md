@@ -60,8 +60,15 @@ nothing tries to page them.
   (it is remembered in the app's defaults). If A2DP does not come back to the headphones, power-cycle
   them (or disconnect/reconnect them in the Bluetooth menu).
 
+- **LDAC support is learned, not probed.** The app never queries headphones it is not streaming to; the
+  list shows «LDAC не проверено» until the first stream. A stream that negotiates LDAC remembers the
+  headphones' LDAC rates; one that finds no LDAC endpoint says «Наушники не поддерживают LDAC» and the
+  toggle stays off for them from then on.
+
 `hiresbuddy-cli` (`swift run hiresbuddy-cli probe | play <wav> | system`) is the command-line
-equivalent, used for hardware testing.
+equivalent, used for hardware testing. **Do not run `probe` while macOS is playing to (owns A2DP on) the
+headphones:** opening the AVDTP signaling channel next to macOS's own makes the headphones drop the
+Bluetooth link about 5 s later, and they do not reconnect by themselves.
 
 ## The original prototype
 

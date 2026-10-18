@@ -10,7 +10,7 @@ import LDACEncoder
 final class SessionControllerTests: XCTestCase {
     func testNoDeviceDisablesToggle() async {
         let h = Harness(paired: [])
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         XCTAssertNil(h.controller.selected)
         XCTAssertFalse(h.controller.canEnable)
         h.controller.setEnabled(true)
@@ -21,7 +21,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testEnableSwitchesOutputAndStartsStream() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         XCTAssertEqual(h.controller.selected?.id, xm4.id)
         XCTAssertTrue(h.controller.driverInstalled)
         XCTAssertTrue(h.controller.canEnable)
@@ -40,7 +40,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testDisableRestoresOutputAndSystemAudio() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
         h.link.connected = [false, false, true]   // the restore hook drops the link, then macOS reconnects
@@ -60,7 +60,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testSessionFailureGoesToErrorAndRestores() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
 
@@ -80,7 +80,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testUnrequestedCloseShowsAnErrorAndRestores() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
         h.link.connected = [false, true]
@@ -96,7 +96,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testRestoreThatThrowsIsRetried() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
         h.link.connected = [false, true]
@@ -124,7 +124,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testQualityChangePropagatesWhileStreaming() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.quality = .hq
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
@@ -138,7 +138,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testQuitWaitsForTheHeadphonesBeforeTerminating() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
         h.link.connected = [false, true]
@@ -157,7 +157,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testCaptureThatFailsToStartShowsAnErrorInsteadOfStreaming() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.capture.startError = HBError.coreAudio(-50)
         h.link.connected = [false, true]
         h.controller.setEnabled(true)
@@ -172,7 +172,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testSampleRateLostMidStreamShowsAnError() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
         XCTAssertEqual(h.controller.phase, .streaming)
@@ -190,7 +190,7 @@ final class SessionControllerTests: XCTestCase {
         timing.headphonesLeftTimeout = 0.3
         timing.reconnectTimeout = 30
         let h = Harness(timing: timing)
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
         h.link.connected = [false]                     // the link is gone and stays gone
@@ -210,7 +210,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testQuitAfterTheHeadphonesLeftIsImmediate() async {
         let h = Harness()                              // default 5 s short wait
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
         h.link.connected = [false]
@@ -226,7 +226,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testSecondQuitCutsTheWaitShort() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         h.recorder.sessions[0].move(to: .streaming)
         h.link.connected = [true]                      // never seen dropping: the wait would run its 80 s
@@ -240,20 +240,73 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertNotEqual(h.directory.defaultOutput, hiresBuddy.id)
     }
 
-    func testEnableIsIgnoredWhileARefreshProbes() async {
-        let gate = ProbeGate()
-        let h = Harness(probe: { await gate.probe($0) })
-        let refresh = Task { await h.controller.refreshHeadphones() }
-        await spin(until: { gate.waiting })
-        XCTAssertTrue(h.controller.isRefreshing)
-        h.controller.selected = xm4
-        XCTAssertFalse(h.controller.canEnable, "the probe holds the peer's open callback")
-        h.controller.setEnabled(true)
-        XCTAssertEqual(h.controller.phase, .off)
+    // MARK: - No probing; LDAC support learned from sessions
+
+    func testRefreshDoesNotOpenAnyChannel() async {
+        var opened: [UInt16] = []
+        let real = HeadphoneDiscovery.channelOpener
+        HeadphoneDiscovery.channelOpener = { _, psm, done in opened.append(psm); done(nil, -1) }
+        defer { HeadphoneDiscovery.channelOpener = real }
+        let h = Harness()
+        h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()            // panel opened again, «Обновить список»
+        await spin(until: { !opened.isEmpty }, timeout: 0.3)
+        XCTAssertEqual(opened, [], "no L2CAP channel is opened to connected headphones on refresh")
         XCTAssertTrue(h.recorder.sessions.isEmpty)
-        gate.release()
-        await refresh.value
+        XCTAssertEqual(h.controller.headphones.map(\.id), [xm4.id])
+        XCTAssertNil(h.controller.selected?.ldacSampleRates, "unknown until a session streams")
+    }
+
+    func testUnknownLDACDeviceCanBeEnabled() {
+        let h = Harness()
+        h.controller.refreshHeadphones()
+        XCTAssertNil(h.controller.selected?.ldacSampleRates)
+        XCTAssertTrue(h.controller.canEnable, "unknown LDAC support does not block the toggle")
+        h.controller.setEnabled(true)
+        XCTAssertEqual(h.controller.phase, .connecting)
+        XCTAssertEqual(h.recorder.sessions.count, 1)
+        h.controller.setEnabled(false)
+    }
+
+    func testLDACRatesAreCachedAfterStreaming() async {
+        let h = Harness()
+        h.controller.refreshHeadphones()
+        h.controller.setEnabled(true)
+        h.recorder.sessions[0].rates = 0x3C
+        h.recorder.sessions[0].move(to: .streaming)
+        XCTAssertEqual(h.defaults.object(forKey: "ldacRates.\(xm4.id)") as? Int, 0x3C)
+        XCTAssertEqual(h.controller.selected?.ldacSampleRates, 0x3C)
+        XCTAssertEqual(h.controller.headphones.first?.ldacSampleRates, 0x3C)
+
+        h.link.connected = [false, true]
+        h.controller.setEnabled(false)
+        h.directory.devices.append(xm4Output)
+        await spin(until: { h.controller.phase == .off })
+        let relaunched = h.makeController()
+        relaunched.refreshHeadphones()
+        XCTAssertEqual(relaunched.headphones.first?.ldacSampleRates, 0x3C, "merged from the cache on refresh")
+        XCTAssertTrue(relaunched.canEnable)
+    }
+
+    func testNoLDACDeviceIsCachedAsZeroAndDisabled() async {
+        let h = Harness()
+        h.controller.refreshHeadphones()
         XCTAssertTrue(h.controller.canEnable)
+        h.controller.setEnabled(true)
+        h.link.connected = [false, true]
+        h.recorder.sessions[0].move(to: .failed, error: HBSessionError(.errorNoLDAC))
+        XCTAssertEqual(h.controller.phase, .error("Наушники не поддерживают LDAC"))
+        XCTAssertEqual(h.defaults.object(forKey: "ldacRates.\(xm4.id)") as? Int, 0)
+        XCTAssertEqual(h.controller.selected?.ldacSampleRates, 0)
+        h.directory.devices.append(xm4Output)
+        await spin(until: { !h.controller.isReturningHeadphones })
+        XCTAssertFalse(h.controller.isReturningHeadphones)
+
+        h.controller.refreshHeadphones()
+        XCTAssertEqual(h.controller.selected?.ldacSampleRates, 0, "stays known after a refresh")
+        XCTAssertFalse(h.controller.canEnable)
+        h.controller.setEnabled(true)
+        XCTAssertEqual(h.recorder.sessions.count, 1, "no new session for headphones without LDAC")
     }
 
     func testDriverInstallFailureStopsAtOnce() async {
@@ -277,7 +330,7 @@ final class SessionControllerTests: XCTestCase {
 
     func testEnablePersistsThePreviousOutput() async {
         let h = Harness()
-        await h.controller.refreshHeadphones()
+        h.controller.refreshHeadphones()
         h.controller.setEnabled(true)
         XCTAssertEqual(h.defaults.string(forKey: OutputDeviceSwitcher.Keys.previousUID), xm4Output.uid)
         h.controller.setEnabled(false)
@@ -303,7 +356,8 @@ final class SessionControllerTests: XCTestCase {
 private let speakers = AudioDeviceInfo(id: 1, uid: "BuiltInSpeakerDevice", name: "MacBook Pro Speakers", isBuiltIn: true)
 private let xm4Output = AudioDeviceInfo(id: 2, uid: "94-DB-56-E1-43-75:output", name: "WH-1000XM4", isBuiltIn: false)
 private let hiresBuddy = AudioDeviceInfo(id: 3, uid: "HiResBuddy_UID", name: "HiRes Buddy", isBuiltIn: false)
-private let xm4 = Headphones(id: "94-db-56-e1-43-75", name: "WH-1000XM4", isConnected: true, ldacSampleRates: 0x3C)
+/// As `pairedA2DPDevices` lists them: LDAC support unknown.
+private let xm4 = Headphones(id: "94-db-56-e1-43-75", name: "WH-1000XM4", isConnected: true, ldacSampleRates: nil)
 
 /// A controller wired to fakes: the headphones' output is default at start and vanishes during the stream.
 @MainActor
@@ -315,20 +369,18 @@ private final class Harness {
     let recorder = SessionRecorder()
     var controller: SessionController!
     private let paired: [Headphones]
-    private let probe: @MainActor (Headphones) async -> Headphones
     private let installer: @MainActor () async throws -> Void
     private let timing: SessionController.Timing
 
     static let fastTiming = SessionController.Timing(reconnectPoll: 0.01, restoreRetry: 0.01, closeTimeout: 0.5)
 
-    init(paired: [Headphones] = [xm4], probe: @escaping @MainActor (Headphones) async -> Headphones = { $0 },
+    init(paired: [Headphones] = [xm4],
          installer: @escaping @MainActor () async throws -> Void = {}, timing: SessionController.Timing = fastTiming) {
         directory = FakeDirectory([speakers, xm4Output, hiresBuddy], defaultOutput: xm4Output.id)
         let suite = "SessionControllerTests.\(UUID())"
         defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         self.paired = paired
-        self.probe = probe
         self.installer = installer
         self.timing = timing
         controller = makeController()
@@ -339,7 +391,6 @@ private final class Harness {
         SessionController(
             defaults: defaults,
             listPaired: { [paired] in paired },
-            probe: probe,
             makeSession: { [directory, recorder] device in
                 recorder.addresses.append(device.addressString.lowercased().replacingOccurrences(of: ":", with: "-"))
                 directory.devices.removeAll { $0.uid == xm4Output.uid }   // takeover: the headphones' output goes
@@ -353,23 +404,6 @@ private final class Harness {
             requestMicrophone: { $0(true) },   // synchronous: the tests drive the phases step by step
             installer: installer,
             timing: timing)
-    }
-}
-
-/// A probe that waits until released.
-@MainActor
-private final class ProbeGate {
-    private var continuation: CheckedContinuation<Void, Never>?
-    var waiting: Bool { continuation != nil }
-
-    func probe(_ h: Headphones) async -> Headphones {
-        await withCheckedContinuation { continuation = $0 }
-        return h
-    }
-
-    func release() {
-        continuation?.resume()
-        continuation = nil
     }
 }
 
@@ -425,6 +459,7 @@ private final class FakeSession: HBAVDTPSession {
     private var fakeState = HBSessionState.idle
     private(set) var startedBit: UInt8 = 0
     private(set) var stopCalled = false
+    var rates: UInt8 = 0
 
     init() {
         var sig: [Int32] = [-1, -1], transport: [Int32] = [-1, -1]
@@ -437,6 +472,7 @@ private final class FakeSession: HBAVDTPSession {
     deinit { fds.forEach { close($0) } }
 
     override var state: HBSessionState { fakeState }
+    override var discoveredLDACRates: UInt8 { rates }
     override var transportFD: Int32 { fakeState == .streaming || fakeState == .suspended ? fds[1] : -1 }
 
     override func start(withSampleRateBit sfBit: UInt8) {

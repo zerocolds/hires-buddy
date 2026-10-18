@@ -38,6 +38,8 @@ public final class SessionController: ObservableObject {
     private enum Keys {
         static let address = "headphoneAddress"
         static let quality = "defaultQuality"
+        /// LDAC sample-rate mask learned from a session, per address; 0 = the session found no LDAC.
+        static func ldacRates(_ address: String) -> String { "ldacRates.\(address)" }
     }
 
     @Published public private(set) var phase: Phase = .off
@@ -56,7 +58,6 @@ public final class SessionController: ObservableObject {
     @Published public private(set) var isReturningHeadphones = false
     /// The stream ended because the headphones went away (link down): shown as the error, not as "returning".
     @Published public private(set) var headphonesLeft = false
-    @Published public private(set) var isRefreshing = false
     @Published public private(set) var isInstallingDriver = false
     /// Why the last driver install failed; nil otherwise.
     @Published public private(set) var driverInstallError: String?
@@ -64,21 +65,21 @@ public final class SessionController: ObservableObject {
     /// The "HiRes Buddy" virtual device is present (as of the last `recheckDriver`).
     @Published public private(set) var driverInstalled = false
 
-    /// The selected headphones are connected, not known to lack LDAC, and the driver is installed; no refresh is
-    /// probing them (a probe holds the peer's single open callback, which a session would overwrite).
+    /// The selected headphones are connected, not known to lack LDAC (unknown is fine: a session without LDAC
+    /// fails fast with HBErrorNoLDAC), and the driver is installed.
     public var canEnable: Bool {
         guard let selected else { return false }
         return selected.isConnected && selected.ldacSampleRates != 0 && driverInstalled && !isReturningHeadphones
-            && !isRefreshing
     }
 
     /// A stream exists or the headphones are still on their way back to macOS: quitting must wait.
     public var hasActiveSession: Bool { streamer != nil || isReturningHeadphones }
 
     private(set) var streamer: Streamer?
+    /// The current stream's session: its discovered LDAC rates are cached once it streams.
+    private var session: HBAVDTPSession?
     private let defaults: UserDefaults
     private let listPaired: @MainActor () -> [Headphones]
-    private let probe: @MainActor (Headphones) async -> Headphones
     private let makeSession: @MainActor (IOBluetoothDevice) -> HBAVDTPSession
     private let makeCapture: @MainActor () throws -> PCMSource
     private let switcher: OutputDeviceSwitcher
@@ -98,7 +99,6 @@ public final class SessionController: ObservableObject {
 
     init(defaults: UserDefaults,
          listPaired: @escaping @MainActor () -> [Headphones] = { HeadphoneDiscovery.pairedA2DPDevices() },
-         probe: @escaping @MainActor (Headphones) async -> Headphones = { await HeadphoneDiscovery.probeLDAC($0) },
          makeSession: @escaping @MainActor (IOBluetoothDevice) -> HBAVDTPSession = {
              HBAVDTPSession(device: $0, helper: HBTransportHelperClient())
          },
@@ -112,7 +112,6 @@ public final class SessionController: ObservableObject {
          timing: Timing = Timing()) {
         self.defaults = defaults
         self.listPaired = listPaired
-        self.probe = probe
         self.makeSession = makeSession
         self.makeCapture = makeCapture
         self.switcher = switcher
@@ -144,19 +143,14 @@ public final class SessionController: ObservableObject {
 
     // MARK: - Headphones
 
-    /// Lists paired A2DP headphones and probes the connected ones for LDAC (a known answer is kept while they stay
-    /// connected). Keeps the selection, else the saved address, else the first connected pair. Not while streaming.
-    public func refreshHeadphones() async {
-        guard streamer == nil, !isReturningHeadphones, !isRefreshing else { return }
-        isRefreshing = true
-        defer { isRefreshing = false }
-        var found = listPaired()
-        for i in found.indices where found[i].isConnected {
-            if let known = headphones.first(where: { $0.id == found[i].id && $0.isConnected }), known.ldacSampleRates != nil {
-                found[i] = known
-            } else {
-                found[i] = await probe(found[i])
-            }
+    /// Lists paired A2DP headphones with the LDAC rates cached from earlier sessions (unknown until the first one).
+    /// Keeps the selection, else the saved address, else the first connected pair. Not while streaming.
+    ///
+    /// Never probes: opening the AVDTP signaling channel while macOS owns A2DP makes the sink drop the link.
+    public func refreshHeadphones() {
+        guard streamer == nil, !isReturningHeadphones else { return }
+        let found = listPaired().map { h in
+            Headphones(id: h.id, name: h.name, isConnected: h.isConnected, ldacSampleRates: cachedLDACRates(h.id))
         }
         headphones = found
         let wanted = selected?.id ?? defaults.string(forKey: Keys.address)
@@ -203,13 +197,16 @@ public final class SessionController: ObservableObject {
         address = target.id
         takeover = isConnected(target.id)
         // The driver applies the Mac's volume itself: the Streamer's gain stays 1.
-        let streamer = Streamer(session: makeSession(device), sampleRate: .hz48000, quality: quality)
+        let session = makeSession(device)
+        self.session = session
+        let streamer = Streamer(session: session, sampleRate: .hz48000, quality: quality)
         streamer.onStats = { [weak self] in self?.stats = $0 }
         streamer.onStateChange = { [weak self] state, err in self?.sessionChanged(state, err) }
         self.streamer = streamer
         log.info("enable: \(target.name, privacy: .public) \(target.id, privacy: .public), \(String(describing: self.quality), privacy: .public), takeover \(self.takeover)")
         do { try streamer.start(source: capture) } catch {
             self.streamer = nil
+            self.session = nil
             restoreOutput()
             fail("Не удалось запустить LDAC-кодер (\(error))")
         }
@@ -267,6 +264,7 @@ public final class SessionController: ObservableObject {
         switch state {
         case .streaming:
             if phase == .connecting { phase = .streaming }
+            if let rates = session?.discoveredLDACRates, rates != 0 { rememberLDACRates(rates, for: address) }
         case .closed:
             log.info("session closed")
             if phase != .stopping { phase = .error("Наушники закрыли поток") }   // not asked for: say so
@@ -274,6 +272,7 @@ public final class SessionController: ObservableObject {
         case .failed:
             log.error("session failed: \(err.map { "\($0)" } ?? "?", privacy: .public)")
             if phase != .stopping { phase = .error(Self.describe(err)) }
+            if Self.isNoLDAC(err) { rememberLDACRates(0, for: address) }
             let left = Self.isSinkDisconnected(err) && !isConnected(address)
             if left { log.info("the headphones left (link down): not waiting for a reconnect") }
             sessionEnded(failed: true, headphonesLeft: left)
@@ -334,6 +333,7 @@ public final class SessionController: ObservableObject {
 
     private func finishReturn() {
         streamer = nil   // kept until now: the session's restore hook runs on in the background
+        session = nil
         stats = nil
         isReturningHeadphones = false
         headphonesLeft = false
@@ -344,7 +344,25 @@ public final class SessionController: ObservableObject {
             completions.forEach { $0() }
             return
         }
-        Task { await refreshHeadphones() }
+        refreshHeadphones()
+    }
+
+    // MARK: - LDAC capability cache
+
+    private func cachedLDACRates(_ address: String) -> UInt8? {
+        (defaults.object(forKey: Keys.ldacRates(address)) as? Int).flatMap { UInt8(exactly: $0) }
+    }
+
+    /// Caches what a session learned about the headphones' LDAC support and shows it in the list and selection.
+    private func rememberLDACRates(_ rates: UInt8, for address: String) {
+        guard !address.isEmpty, cachedLDACRates(address) != rates else { return }
+        defaults.set(Int(rates), forKey: Keys.ldacRates(address))
+        log.info("LDAC rates for \(address, privacy: .public): \(rates)")
+        func update(_ h: Headphones) -> Headphones {
+            h.id == address ? Headphones(id: h.id, name: h.name, isConnected: h.isConnected, ldacSampleRates: rates) : h
+        }
+        headphones = headphones.map(update)
+        if let selected, selected.id == address { self.selected = update(selected) }
     }
 
     @discardableResult
@@ -407,6 +425,11 @@ public final class SessionController: ObservableObject {
         return e.domain == HBErrorDomain && e.code == HBSessionError.errorSinkDisconnected.rawValue
     }
 
+    static func isNoLDAC(_ err: Error?) -> Bool {
+        guard let e = err as NSError? else { return false }
+        return e.domain == HBErrorDomain && e.code == HBSessionError.errorNoLDAC.rawValue
+    }
+
     static func describe(_ err: Error?) -> String {
         if let failure = err as? StreamFailure {
             switch failure {
@@ -423,7 +446,7 @@ public final class SessionController: ObservableObject {
         let detail = " (код \(e.code): \(e.localizedDescription))"
         switch HBSessionError.Code(rawValue: e.code) {
         case .errorSinkRejected?: return "Наушники отклонили LDAC-поток"
-        case .errorNoLDAC?: return "Наушники не поддерживают LDAC 48 кГц"
+        case .errorNoLDAC?: return "Наушники не поддерживают LDAC"
         case .errorSinkDisconnected?: return "Наушники отключились"
         case .errorChannelOpenFailed?: return "Не удалось подключиться к наушникам" + detail
         case .errorTransportFailed?: return "Не удалось открыть аудиоканал (hiresbuddy-transport)"

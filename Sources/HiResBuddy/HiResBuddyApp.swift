@@ -33,7 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             source.resume()
             return source
         }
-        Task { await controller.refreshHeadphones() }
+        controller.refreshHeadphones()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

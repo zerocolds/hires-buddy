@@ -140,6 +140,9 @@ typedef NS_ENUM(NSInteger, HBSessionState) {
 @property(readonly) uint16_t transportMTU;
 /// The LDAC sample-rate bit accepted by the sink; 0 before SET_CONFIGURATION is accepted.
 @property(readonly) uint8_t negotiatedSampleRateBit;
+/// The LDAC sample-rate mask (0x20 44.1, 0x10 48, 0x08 88.2, 0x04 96 kHz) the chosen sink endpoint advertised in
+/// GET_CAPABILITIES; 0 until an endpoint fits. Lets the app learn a device's LDAC support from a real session.
+@property(readonly) uint8_t discoveredLDACRates;
 /// Gives A2DP back to macOS; runs at most once, before the Closed/Failed callback: on stopAndRestoreSystemAudio,
 /// and on any failure after a takeover — except when the headphones left on their own (linkProbe says the link is
 /// down) on a Failed HBErrorSinkDisconnected, or on a stop after the stream had been configured: then there is
